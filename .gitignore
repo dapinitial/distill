@@ -1,0 +1,14 @@
+.env
+.env.*
+!.env.example
+.DS_Store
+models/
+out/
+*.wav
+*.m4a
+*.mp3
+*.mp4
+*.webm
+__pycache__/
+.venv/
+node_modules/
