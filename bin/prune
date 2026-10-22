@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# prune: free disk by deleting regenerable media older than N days; the text outputs stay.
+#   prune [--days 30] [--dry-run]
+# Removes media/, audio.wav, whisper.json, whisper.log and frames/ from transcript folders whose
+# source.json is older than --days. Everything can be rebuilt from the link in source.json
+# (a local file's path is kept too). Never touches transcript.*, chunks.jsonl, notes or pages.
+set -euo pipefail
+OUT="${DISTILL_OUT:-$(cd "$(dirname "$0")/.." && pwd)/out}"
+DAYS=30; DRY=0
+while [[ $# -gt 0 ]]; do case "$1" in --days) DAYS="$2"; shift 2;; --dry-run) DRY=1; shift;; *) echo "unknown: $1" >&2; exit 2;; esac; done
+total=0
+while IFS= read -r src; do
+  d="$(dirname "$src")"
+  for f in "$d/media" "$d/audio.wav" "$d/whisper.json" "$d/whisper.log" "$d/frames"; do
+    [[ -e "$f" ]] || continue
+    kb=$(du -sk "$f" | cut -f1); total=$((total + kb))
+    if [[ $DRY -eq 1 ]]; then echo "would remove $f ($((kb / 1024)) MB)"; else rm -rf "$f"; echo "removed $f ($((kb / 1024)) MB)"; fi
+  done
+done < <(find "$OUT" -mindepth 2 -maxdepth 2 -name source.json -mtime +"$DAYS")
+echo "$((total / 1024)) MB $( [[ $DRY -eq 1 ]] && echo 'would be' || echo '' ) freed"

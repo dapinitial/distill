@@ -4,7 +4,8 @@
 #
 #   distill-batch [queue.txt] [--publish] [--redo] [--dry-run]
 #
-# queue.txt: one URL, playlist URL or file path per line; "#" comments; blank lines ignored.
+# queue.txt: one URL, playlist URL or file path per line, optionally followed by transcribe flags
+# (e.g. "<url> --speakers --video"); "#" comments; blank lines ignored.
 # Finished lines move to queue.done.txt with a timestamp and result. Log: $DISTILL_OUT/batch.log.
 # Scheduling (not installed for you): a launchd/cron line such as
 #   0 6 * * *  cd ~/Sites/distill && direnv exec . bin/distill-batch >> out/cron.log 2>&1
@@ -31,21 +32,29 @@ mkdir -p "$DISTILL_OUT"
 log() { printf '%s  %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" | tee -a "$LOG" >&2; }
 
 [[ -f "$QUEUE" ]] || { log "no queue at $QUEUE"; exit 0; }
+LOCK="$DISTILL_OUT/.batch.lock"
+if ! mkdir "$LOCK" 2>/dev/null; then
+  if [[ -f "$LOCK/pid" ]] && kill -0 "$(cat "$LOCK/pid")" 2>/dev/null; then log "another batch is running (pid $(cat "$LOCK/pid")); exiting"; exit 0; fi
+  rm -rf "$LOCK"; mkdir "$LOCK"
+fi
+echo $$ > "$LOCK/pid"; trap 'rm -rf "$LOCK"' EXIT
 mapfile -t ITEMS < <(grep -vE '^\s*(#|$)' "$QUEUE")
 [[ ${#ITEMS[@]} -gt 0 ]] || { log "queue empty"; exit 0; }
 log "batch start: ${#ITEMS[@]} item(s)"
 
+# The Artifact tool is not available in headless mode, so --publish queues each finished folder in
+# $DISTILL_OUT/publish-pending.txt; an interactive session publishes them ("/cliffnotes publish pending").
 # Claude may call a script bare, as bin/x, or by absolute path; allow all three spellings.
 TOOLS="Read Write Edit"
 for t in transcribe verify-quotes where stamp render library glossary-suggest; do
   TOOLS="$TOOLS Bash($t:*) Bash(bin/$t:*) Bash($HOME_DIR/bin/$t:*)"
 done
-[[ $PUBLISH -eq 1 ]] && TOOLS="$TOOLS Artifact"
 
 notes_for() {  # $1 = transcript folder
   local folder="$1" prompt
   prompt="/cliffnotes $folder"
-  [[ $PUBLISH -eq 1 ]] && prompt="$prompt — after verify-quotes passes, run render and publish index.html as an Artifact, then write {\"url\": \"<artifact url>\"} to $folder/artifact.json."
+  [[ -f "$folder/meeting.md" || "$(jq -r '.speaker_labels' "$folder/source.json" 2>/dev/null)" == "true" ]] && prompt="$prompt (this is a meeting recording: write meeting.md)"
+  prompt="$prompt — after verify-quotes passes, run render on the folder. Do not try to publish; the Artifact tool is not available here."
   [[ $REDO -eq 1 ]] && prompt="$prompt (rewrite cliffnotes.md even though one exists)"
   if [[ $DRY -eq 1 ]]; then log "would run: claude -p \"$prompt\""; return 0; fi
   ( cd "$HOME_DIR" && claude -p "$prompt" --permission-mode acceptEdits --allowedTools $TOOLS --output-format text ) \
@@ -63,14 +72,19 @@ for item in "${ITEMS[@]}"; do
       log "FAILED transcribe: $item"; bad=$((bad+1)); printf '%s\tFAILED transcribe\t%s\n' "$(date +%F)" "$item" >> "$DONE"; continue
     fi
   fi
-  if [[ $DRY -eq 0 && -f "$folder/cliffnotes.md" && $REDO -eq 0 ]]; then
+  if [[ $DRY -eq 0 && ( -f "$folder/cliffnotes.md" || -f "$folder/meeting.md" ) && $REDO -eq 0 ]]; then
     log "notes exist, skipping cliffnotes: $folder"
   else
     log "cliffnotes: $folder"
     notes_for "$folder"
   fi
-  if [[ $DRY -eq 1 ]] || verify-quotes "$folder/cliffnotes.md" >/dev/null 2>&1; then
+  notes="$folder/cliffnotes.md"; [[ -f "$folder/meeting.md" && ! -f "$notes" ]] && notes="$folder/meeting.md"
+  if [[ $DRY -eq 1 ]] || verify-quotes "$notes" >/dev/null 2>&1; then
     ok=$((ok+1)); printf '%s\tok\t%s\t%s\n' "$(date +%F)" "$item" "$folder" >> "$DONE"
+    if [[ $PUBLISH -eq 1 && $DRY -eq 0 && ! -f "$folder/artifact.json" ]]; then
+      grep -qxF "$folder" "$DISTILL_OUT/publish-pending.txt" 2>/dev/null || echo "$folder" >> "$DISTILL_OUT/publish-pending.txt"
+      log "queued for publishing: $folder"
+    fi
     log "done: $folder"
   else
     bad=$((bad+1)); printf '%s\tFAILED notes\t%s\t%s\n' "$(date +%F)" "$item" "$folder" >> "$DONE"

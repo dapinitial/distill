@@ -50,7 +50,8 @@ Or in Claude Code: `/transcribe <link>` then `/cliffnotes <folder>`, or just `/c
 Put links in `queue.txt` (one per line, playlists allowed) and run `distill-batch`. It transcribes
 each item, runs the cliffnotes skill headlessly in Claude Code (`claude -p`), checks the result with
 `verify-quotes`, refreshes the library and moves finished lines to `queue.done.txt`. Add `--publish`
-to also publish each page as an Artifact. Schedule it with cron, launchd, or a Claude Code routine:
+to queue each finished page in `out/publish-pending.txt`; say "publish pending" in an interactive
+Claude Code session to publish them as Artifacts (the Artifact tool is not available headless). Schedule it with cron, launchd, or a Claude Code routine:
 
 ```
 0 6 * * *  cd ~/Sites/distill && direnv exec . bin/distill-batch >> out/cron.log 2>&1
@@ -83,12 +84,17 @@ Each transcript folder holds:
 | `distill-batch` | queue runner for unattended transcribe → cliffnotes → verify → library |
 | `test` | regression checks for the cleanup rules, sectioning, speakers and verify-quotes |
 | `diarize` | who spoke when, as JSON; used by `transcribe --speakers` |
+| `prune` | delete regenerable media and Whisper caches older than N days; text outputs stay |
 
 ## Sections
 
 When the creator published chapter marks, those become the sections (snapped to sentence ends,
 tiny chapters merged, huge ones split at pauses) and each section carries its chapter title.
 Otherwise sections are cut at the longest pause between 90 seconds and 5 minutes, aiming for 3.
+
+## Whisper settings that matter
+
+Whisper is given a short punctuated initial prompt (`--prompt`), because without one it sometimes drops into lowercase, unpunctuated output for a whole file, which ruins sentence and section boundaries. transcribe warns when a transcript comes back with almost no sentence ends. The prompt is also the place to put names Whisper should expect.
 
 ## Cleanup is code, not a model
 
@@ -101,7 +107,7 @@ bin/setup --speakers                 # once: sherpa-onnx in .venv (needs cmake),
 transcribe meeting.m4a --speakers    # or --speakers 3 when you know the count
 ```
 
-Speakers are detected locally (pyannote segmentation + TitaNet embeddings via sherpa-onnx, CPU, about a tenth of real time) and numbered in order of first appearance, never named. Paragraphs break on every speaker change and carry `**Speaker N:**`; `chunks.jsonl` text has the same labels inline. Words right at a turn boundary can land on the wrong side by a word or two, since Whisper's word times are only accurate to about a second. For meetings, the cliffnotes skill writes `meeting.md` (decisions, action items, open questions, timeline) instead of cliff notes.
+Speakers are detected locally (pyannote segmentation + TitaNet embeddings via sherpa-onnx, CPU, about a tenth of real time) and numbered in order of first appearance, never named. Crosstalk makes the clustering invent extra voices; anyone with under 5 seconds or 3% of the speech is folded into the neighbouring speaker, and `--speaker-threshold` (default 0.5; higher merges more) or `--speakers N` tunes the rest. Once a folder has `speakers.json`, reruns keep the labels. Paragraphs break on every speaker change and carry `**Speaker N:**`; `chunks.jsonl` text has the same labels inline. Words right at a turn boundary can land on the wrong side by a word or two, since Whisper's word times are only accurate to about a second. For meetings, the cliffnotes skill writes `meeting.md` (decisions, action items, open questions, timeline) instead of cliff notes.
 
 ## Limits
 

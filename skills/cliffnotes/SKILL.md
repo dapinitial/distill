@@ -155,6 +155,14 @@ becomes the shareable, navigable view; the markdown folder stays the source of t
 comment on the artifact and the publishing session sees it, so a viewer can ask about a passage
 from the page itself. Report the artifact link with the notes.
 
+### Publish pending
+
+`distill-batch --publish` cannot publish (no Artifact tool headless), so it lists finished folders in
+`$DISTILL_OUT/publish-pending.txt`. When the user says "publish pending" (or you see that file is not
+empty while doing other distill work), for each folder: publish `index.html` with the Artifact tool
+(or republish with its `url` if `artifact.json` already exists), write `artifact.json`, remove the
+line, then run `library`. Report the links.
+
 ## 6. Show the notes
 
 Unattended runs: `distill-batch` calls this skill headlessly for each queued item and checks the

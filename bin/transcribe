@@ -80,6 +80,15 @@ def resolve_source(inp: str, out_root: Path, slug_override: str | None, force: b
             return info, None, None  # caller expands the entries
         title = info.get("title") or "untitled"
         slug = slug_override or slugify(title)
+        if not slug_override and info.get("id"):
+            for prev in out_root.glob("*/source.json"):  # same video under an older title: reuse its folder
+                try:
+                    if json.loads(prev.read_text()).get("id") == info["id"] and prev.parent.name != slug:
+                        slug = prev.parent.name
+                        log(f"  already transcribed as {slug}; reusing that folder")
+                        break
+                except (OSError, ValueError):
+                    continue
         out_dir = out_root / slug
         media_dir = out_dir / "media"
         media_dir.mkdir(parents=True, exist_ok=True)
@@ -89,9 +98,18 @@ def resolve_source(inp: str, out_root: Path, slug_override: str | None, force: b
             log(f"  download: skipped, have {media.name}")
         else:
             def dl():
-                run(["yt-dlp", "--no-playlist", "--no-warnings", "--quiet", "--no-progress", "-f", "bestaudio/best",
-                     "--write-subs", "--write-auto-subs", "--sub-langs", "en.*,en", "--sub-format", "vtt",
-                     "-o", str(media_dir / "audio.%(ext)s"), inp])
+                try:
+                    run(["yt-dlp", "--no-playlist", "--no-warnings", "--quiet", "--no-progress", "-f", "bestaudio/best",
+                         "-o", str(media_dir / "audio.%(ext)s"), inp], capture_output=True)
+                except subprocess.CalledProcessError as e:
+                    tail = (e.stderr or "").strip().splitlines()[-1:] or ["no error text"]
+                    sys.exit(f"transcribe: yt-dlp could not download the audio: {tail[0]}\n"
+                             "  If this is a YouTube change, run: brew upgrade yt-dlp")
+                # captions are a bonus: exact language codes only (a wildcard pulls dozens of
+                # auto-translations and trips YouTube's rate limit), and failure is not fatal
+                subprocess.run(["yt-dlp", "--no-playlist", "--no-warnings", "--quiet", "--skip-download",
+                                "--write-subs", "--write-auto-subs", "--sub-langs", "en-orig,en", "--sub-format", "vtt",
+                                "-o", str(media_dir / "audio.%(ext)s"), inp], capture_output=True)
                 return [p for p in media_dir.glob("audio.*") if p.suffix not in (".part", ".vtt")][0]
             media = timer.step("download", dl)
         have_video = [p for p in media_dir.glob("video.*") if p.suffix != ".part"]
@@ -137,7 +155,11 @@ def to_wav(media: Path, wav: Path, force: bool, timer: Timer) -> None:
          "-c:a", "pcm_s16le", str(wav)]))
 
 
-def whisper(wav: Path, prefix: Path, model: Path, lang: str, threads: int, force: bool, timer: Timer) -> dict:
+PROMPT = "Hello, and welcome. Today we're talking about what happened, why it matters, and what comes next."
+
+
+def whisper(wav: Path, prefix: Path, model: Path, lang: str, threads: int, force: bool, timer: Timer,
+            prompt: str = PROMPT) -> dict:
     out = prefix.with_suffix(".json")
     if out.exists() and not force:
         log("  whisper: skipped, have whisper.json (use --force to redo)")
@@ -145,7 +167,7 @@ def whisper(wav: Path, prefix: Path, model: Path, lang: str, threads: int, force
         if not model.exists():
             sys.exit(f"transcribe: model not found at {model} (run bin/setup)")
         cmd = ["whisper-cli", "-m", str(model), "-f", str(wav), "-l", lang, "-t", str(threads),
-               "-oj", "-ojf", "-of", str(prefix), "-np", "-pp"]
+               "-oj", "-ojf", "-of", str(prefix), "-np", "-pp", "--prompt", prompt]
         timer.step("whisper", lambda: run(cmd, stdout=subprocess.DEVNULL,
                                            stderr=open(prefix.with_suffix(".log"), "w")))
     return json.loads(out.read_text())
@@ -153,8 +175,8 @@ def whisper(wav: Path, prefix: Path, model: Path, lang: str, threads: int, force
 
 # ---------- 4. tokens -> words -------------------------------------------------------------
 
-def words_from_whisper(data: dict) -> tuple[list[dict], list[dict]]:
-    """Merge whisper tokens into words. Returns (words, dropped_suspect_segments)."""
+def words_from_whisper(data: dict) -> tuple[list[dict], list[dict], list[dict]]:
+    """Merge whisper tokens into words. Returns (words, dropped_suspect_segments, suspect_mid_segments)."""
     segs: list[list[dict]] = []
     for seg in data["transcription"]:
         if NONSPEECH_RE.match(seg["text"]) or not seg["text"].strip():
@@ -188,6 +210,15 @@ def words_from_whisper(data: dict) -> tuple[list[dict], list[dict]]:
     while len(segs) > 1 and suspect(segs[-1], segs[-2], False):
         dropped.append(segs.pop())
 
+    # inside the talk, an isolated low-confidence segment is reported but kept: it may be real speech after a music break
+    suspect_mid = []
+    for k in range(1, len(segs) - 1):
+        gap_before = segs[k][0]["start"] - segs[k - 1][-1]["end"]
+        gap_after = segs[k + 1][0]["start"] - segs[k][-1]["end"]
+        if min(gap_before, gap_after) >= SUSPECT_GAP and min(w["p"] for w in segs[k]) < SUSPECT_P:
+            suspect_mid.append({"start": round(segs[k][0]["start"], 2), "end": round(segs[k][-1]["end"], 2),
+                                "text": " ".join(w["word"] for w in segs[k]), "min_p": round(min(w["p"] for w in segs[k]), 3)})
+
     words = [w for seg in segs for w in seg]
     for i, w in enumerate(words):  # keep times monotonic and sane
         if i and w["start"] < words[i - 1]["start"]:
@@ -197,7 +228,7 @@ def words_from_whisper(data: dict) -> tuple[list[dict], list[dict]]:
     dropped_info = [{"start": round(d[0]["start"], 2), "end": round(d[-1]["end"], 2),
                      "text": " ".join(w["word"] for w in d), "min_p": round(min(w["p"] for w in d), 3)}
                     for d in dropped]
-    return drop_inline_nonspeech(words), dropped_info
+    return drop_inline_nonspeech(words), dropped_info, suspect_mid
 
 
 def drop_inline_nonspeech(words: list[dict]) -> list[dict]:
@@ -345,6 +376,37 @@ def tidy(words: list[dict]) -> list[dict]:
 # ---------- 6. sentences, 7. sections -----------------------------------------------------
 
 SENT_END = re.compile(r"[.?!][\"')\]]*$")
+
+
+def absorb_minor_speakers(turns: list[dict]) -> tuple[list[dict], int]:
+    """Diarization on crosstalk invents speakers for a few seconds of audio. Fold anyone with under
+    5 s or under 3% of the speech into whoever spoke just before (or after, at the start)."""
+    total: dict[int, float] = {}
+    for t in turns:
+        total[t["speaker"]] = total.get(t["speaker"], 0.0) + (t["end"] - t["start"])
+    speech = sum(total.values()) or 1.0
+    minor = {s for s, secs in total.items() if secs < 5.0 or secs / speech < 0.03}
+    if len(total) - len(minor) < 1:
+        return turns, 0
+    out = [dict(t) for t in turns]
+    for i, t in enumerate(out):
+        if t["speaker"] in minor:
+            prev = next((x["speaker"] for x in reversed(out[:i]) if x["speaker"] not in minor), None)
+            nxt = next((x["speaker"] for x in out[i + 1:] if x["speaker"] not in minor), None)
+            t["speaker"] = prev if prev is not None else nxt
+    # renumber by first appearance
+    order: dict[int, int] = {}
+    for t in out:
+        order.setdefault(t["speaker"], len(order))
+        t["speaker"] = order[t["speaker"]]
+    # merge adjacent same-speaker turns
+    merged: list[dict] = []
+    for t in out:
+        if merged and merged[-1]["speaker"] == t["speaker"] and t["start"] - merged[-1]["end"] < 1.0:
+            merged[-1]["end"] = max(merged[-1]["end"], t["end"])
+        else:
+            merged.append(t)
+    return merged, len(minor)
 
 
 def assign_speakers(words: list[dict], turns: list[dict]) -> None:
@@ -540,6 +602,11 @@ def main() -> None:
     ap.add_argument("--no-glossary", action="store_true", help="skip glossary rules (to see what Whisper said raw)")
     ap.add_argument("--speakers", nargs="?", const=-1, type=int, default=None, metavar="N",
                     help="label speakers (numbered, not named); give N when you know how many")
+    ap.add_argument("--speaker-threshold", type=float, default=0.5,
+                    help="clustering threshold when detecting speakers; lower splits more (0.3–0.8)")
+    ap.add_argument("--no-speakers", action="store_true", help="ignore an existing speakers.json")
+    ap.add_argument("--prompt", default=PROMPT, help="initial prompt for Whisper; a punctuated sentence keeps it "
+                    "producing punctuation and capitals, and it can carry names (see glossary) and jargon")
     ap.add_argument("--quiet", action="store_true")
     a = ap.parse_args()
     if a.quiet:
@@ -569,21 +636,26 @@ def main() -> None:
     wav = out_dir / "audio.wav"
     to_wav(media, wav, a.force, timer)
     model = Path(a.model).expanduser()
-    raw = whisper(wav, out_dir / "whisper", model, a.lang, a.threads, a.force, timer)
+    raw = whisper(wav, out_dir / "whisper", model, a.lang, a.threads, a.force, timer, a.prompt)
     turns: list[dict] = []
+    dz = out_dir / "speakers.json"
+    if a.speakers is None and dz.exists() and not a.no_speakers:
+        a.speakers = -1  # labelled once, stays labelled on reruns
     if a.speakers is not None:
-        dz = out_dir / "speakers.json"
         if dz.exists() and not a.force:
             log("  speakers: skipped, have speakers.json")
         else:
             def diarize():
-                cmd = [str(HERE / "diarize"), str(wav)] + (["--speakers", str(a.speakers)] if a.speakers > 0 else [])
+                cmd = [str(HERE / "diarize"), str(wav), "--threshold", str(a.speaker_threshold)] + \
+                      (["--speakers", str(a.speakers)] if a.speakers > 0 else [])
                 dz.write_text(run(cmd, capture_output=True).stdout)
             timer.step("speakers", diarize)
-        turns = json.loads(dz.read_text())
+        turns, folded = absorb_minor_speakers(json.loads(dz.read_text()))
+        if folded:
+            log(f"  speakers: folded {folded} minor voice(s) into their neighbours")
 
     def post():
-        words, dropped = words_from_whisper(raw)
+        words, dropped, suspect_mid = words_from_whisper(raw)
         words = tidy(words)
         n_raw = len(words)
         words, n_fill = remove_fillers(words)
@@ -609,7 +681,7 @@ def main() -> None:
                for w in words if w["p"] < LOW_P]
         return words, secs, {"words_raw": n_raw, "fillers_removed": n_fill, "stutter_words_removed": n_stut,
                              "glossary_replacements": n_gl, "glossary_files": [str(p) for p in gl_paths],
-                             "dropped_suspect_segments": dropped,
+                             "dropped_suspect_segments": dropped, "suspect_segments_kept": suspect_mid,
                              "low_confidence_words": low[:100], "low_confidence_count": len(low)}
 
     words, secs, cleanup = timer.step("cleanup+sections", post)
@@ -628,6 +700,12 @@ def main() -> None:
     write_outputs(out_dir, source, words, secs)
     for d in cleanup["dropped_suspect_segments"]:
         log(f"  dropped suspect segment at {hms(d['start'])}: \"{d['text']}\" (p={d['min_p']})")
+    sentence_ends = sum(1 for w in words if SENT_END.search(w["word"]))
+    if len(words) > 200 and sentence_ends < len(words) / 60:
+        log(f"  WARNING: almost no punctuation ({sentence_ends} sentence ends in {len(words)} words); sections and "
+            "quotes will suffer. Rerun with --force and a different --prompt.")
+    for d in cleanup["suspect_segments_kept"]:
+        log(f"  suspect but kept (isolated, p={d['min_p']}) at {hms(d['start'])}: \"{d['text'][:60]}\"")
     if cleanup["low_confidence_count"]:
         sample = ", ".join(f"{w['word']}@{w['at']}" for w in cleanup["low_confidence_words"][:8])
         log(f"  low-confidence words: {cleanup['low_confidence_count']} (see source.json), e.g. {sample}")

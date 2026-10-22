@@ -22,6 +22,7 @@ transcribe <playlist-url> --playlist     # every entry becomes its own folder
 transcribe <url> --video                 # also keep 720p video so render can grab frames
 transcribe <file> --no-chapters          # ignore chapter marks, cut at pauses only
 transcribe <file> --speakers             # label speakers (numbered); --speakers 3 if you know the count
+transcribe <file> --prompt "Hi. Today Priya and Tomasz discuss Kubernetes."   # names Whisper should expect
 ```
 
 `transcribe` lives in this repo's `bin/`. From another project it is on PATH only if direnv has
@@ -89,7 +90,18 @@ and writes `**Speaker N:**` at every change of voice in `transcript.md`, the sam
 in `chunks.jsonl`, and `speaker` on each word in `transcript.json`. Speakers are numbered by
 first appearance, never named; if the user tells you who is who, say so in the notes rather than
 editing the transcript. Use it for meetings, interviews and podcasts; a single-speaker talk gains
-nothing. Expect a word or two to sit on the wrong side of a turn boundary.
+nothing. Expect a word or two to sit on the wrong side of a turn boundary. Voices invented by
+crosstalk (under 5 s or 3% of speech) are folded into their neighbours; if the count is still
+too high, rerun with `--speakers N` or a higher `--speaker-threshold` (labels are recomputed only
+with `--force`).
+
+## Watch for
+
+- The run summary says **almost no punctuation**: Whisper fell into its unpunctuated mode. Rerun
+  with `--force` and a different `--prompt` (a longer, clearly punctuated sentence).
+- **suspect but kept** segments: isolated low-confidence speech mid-file, often a hallucination
+  over music. Tell the user; do not build quotes on them.
+- yt-dlp errors: usually YouTube changed something; `brew upgrade yt-dlp`.
 
 ## Limits
 
