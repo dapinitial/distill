@@ -1,6 +1,6 @@
 ---
 name: transcribe
-description: Turn a video or audio file, or a URL (YouTube and anything yt-dlp handles), into an LLM-ready transcript with word-level timestamps, using local Whisper (whisper.cpp large-v3-turbo on Metal). Use when the user says "transcribe this", "get me the transcript", "what did they say in this video", or hands you a media file or video link. Output is a folder with transcript.md, transcript.json, chunks.jsonl and source.json. Nothing is uploaded.
+description: Turn a video or audio file, or a URL (YouTube and anything yt-dlp handles, playlists too), into an LLM-ready transcript with word-level timestamps and optional speaker labels, using local Whisper (whisper.cpp large-v3-turbo on Metal). Use when the user says "transcribe this", "get me the transcript", "what did they say in this video", or hands you a media file, meeting recording or video link. Output is a folder with transcript.md, transcript.json, chunks.jsonl and source.json. Nothing is uploaded.
 ---
 
 # /transcribe — file or link → transcript folder
@@ -21,6 +21,7 @@ transcribe <url> --force                 # redo download, audio and Whisper (oth
 transcribe <playlist-url> --playlist     # every entry becomes its own folder
 transcribe <url> --video                 # also keep 720p video so render can grab frames
 transcribe <file> --no-chapters          # ignore chapter marks, cut at pauses only
+transcribe <file> --speakers             # label speakers (numbered); --speakers 3 if you know the count
 ```
 
 `transcribe` lives in this repo's `bin/`. From another project it is on PATH only if direnv has
@@ -81,9 +82,18 @@ After it finishes, tell the user:
   repo one for general terms, a `glossary.txt` in the user's project for its own names), and
   rerun transcribe (seconds, since Whisper is cached). Never edit the transcript files by hand.
 
-## Limits (v1)
+## Speakers
 
-- **No speaker labels.** Dialogue is one stream; say so if the user asks who said what.
+Off by default. `--speakers` runs local diarization (sherpa-onnx; `bin/setup --speakers` once)
+and writes `**Speaker N:**` at every change of voice in `transcript.md`, the same labels inline
+in `chunks.jsonl`, and `speaker` on each word in `transcript.json`. Speakers are numbered by
+first appearance, never named; if the user tells you who is who, say so in the notes rather than
+editing the transcript. Use it for meetings, interviews and podcasts; a single-speaker talk gains
+nothing. Expect a word or two to sit on the wrong side of a turn boundary.
+
+## Limits
+
+- Without `--speakers`, dialogue is one stream; say so if the user asks who said what.
 - English by default; `--lang auto` works but the cleanup rules are tuned for English, and the
   word-splitting assumes spaces between words.
 - Word times are Whisper's token offsets (DTW timing is off because flash attention is on);

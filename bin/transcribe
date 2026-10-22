@@ -347,6 +347,25 @@ def tidy(words: list[dict]) -> list[dict]:
 SENT_END = re.compile(r"[.?!][\"')\]]*$")
 
 
+def assign_speakers(words: list[dict], turns: list[dict]) -> None:
+    """Each word takes the speaker whose segment overlaps it most; gaps inherit the previous word."""
+    j = 0
+    last = 0
+    for w in words:
+        best, best_ov = None, 0.0
+        while j < len(turns) and turns[j]["end"] < w["start"] - 1.0:
+            j += 1
+        for t in turns[j:j + 6]:
+            ov = min(w["end"], t["end"]) - max(w["start"], t["start"])
+            if ov > best_ov:
+                best, best_ov = t["speaker"], ov
+        if best is None:  # no overlap: nearest segment edge within 1 s, else carry on
+            near = min(turns, key=lambda t: min(abs(t["start"] - w["start"]), abs(t["end"] - w["end"])), default=None)
+            best = near["speaker"] if near and min(abs(near["start"] - w["start"]), abs(near["end"] - w["end"])) < 1.0 else last
+        w["speaker"] = best
+        last = best
+
+
 def sentences(words: list[dict], max_gap: float = 2.0, max_len: float = 45.0) -> list[dict]:
     sents: list[dict] = []
     cur: list[dict] = []
@@ -356,10 +375,17 @@ def sentences(words: list[dict], max_gap: float = 2.0, max_len: float = 45.0) ->
         ends = SENT_END.search(w["word"]) is not None
         gap = (nxt["start"] - w["end"]) if nxt else 0
         too_long = (w["end"] - cur[0]["start"]) > max_len and gap > 0.6
-        if ends or gap > max_gap or too_long or nxt is None:
+        switch = nxt is not None and "speaker" in w and nxt.get("speaker") != w["speaker"] and len(cur) >= 3
+        if ends or gap > max_gap or too_long or switch or nxt is None:
+            spk = None
+            if "speaker" in cur[0]:
+                counts: dict[int, int] = {}
+                for x in cur:
+                    counts[x["speaker"]] = counts.get(x["speaker"], 0) + 1
+                spk = max(counts, key=counts.get)
             sents.append({"start": cur[0]["start"], "end": cur[-1]["end"],
                           "text": " ".join(x["word"] for x in cur), "n": len(cur),
-                          "gap_after": gap if nxt else 0.0})
+                          "gap_after": gap if nxt else 0.0, "speaker": spk})
             cur = []
     return sents
 
@@ -432,6 +458,8 @@ def paragraphs(sents: list[dict], min_len: float = 20.0, max_len: float = 75.0, 
     paras: list[list[dict]] = []
     cur: list[dict] = []
     for s in sents:
+        if cur and s.get("speaker") is not None and s["speaker"] != cur[-1].get("speaker"):
+            paras.append(cur); cur = []
         cur.append(s)
         dur = cur[-1]["end"] - cur[0]["start"]
         if (dur >= min_len and s["gap_after"] >= gap) or dur >= max_len:
@@ -443,6 +471,17 @@ def paragraphs(sents: list[dict], min_len: float = 20.0, max_len: float = 75.0, 
 
 # ---------- 8. write -----------------------------------------------------------------------
 
+def labelled(sents: list[dict]) -> str:
+    """Sentences joined, with 'Speaker N:' wherever the speaker changes."""
+    out, last = [], None
+    for s in sents:
+        if s.get("speaker") is not None and s["speaker"] != last:
+            out.append(f"Speaker {s['speaker'] + 1}:")
+            last = s["speaker"]
+        out.append(s["text"])
+    return " ".join(out)
+
+
 def write_outputs(out_dir: Path, source: dict, words: list[dict], secs: list[list[dict]]) -> None:
     hours = source["duration"] >= 3600
     sec_records = []
@@ -450,7 +489,7 @@ def write_outputs(out_dir: Path, source: dict, words: list[dict], secs: list[lis
         sec_records.append({
             "index": k, "start": round(sec[0]["start"], 2), "end": round(sec[-1]["end"], 2),
             "start_hms": hms(sec[0]["start"], hours), "end_hms": hms(sec[-1]["end"], hours),
-            "text": " ".join(s["text"] for s in sec), "word_count": sum(s["n"] for s in sec),
+            "text": labelled(sec), "word_count": sum(s["n"] for s in sec),
             "title": sec[0].get("chapter"),
         })
 
@@ -460,19 +499,22 @@ def write_outputs(out_dir: Path, source: dict, words: list[dict], secs: list[lis
 
     (out_dir / "transcript.json").write_text(json.dumps({
         "title": source["title"], "url": source["url"], "duration": source["duration"],
-        "words": [{"word": w["word"], "start": round(w["start"], 2), "end": round(w["end"], 2), "p": round(w["p"], 2)} for w in words],
+        "words": [{"word": w["word"], "start": round(w["start"], 2), "end": round(w["end"], 2), "p": round(w["p"], 2),
+                   **({"speaker": w["speaker"]} if "speaker" in w else {})} for w in words],
         "sections": [{k: v for k, v in r.items() if k != "text"} for r in sec_records],
     }, ensure_ascii=False))
 
     lines = [f"# {source['title']}", ""]
-    meta = [f"Duration {hms(source['duration'], hours)}", f"Model {source['model']}", "No speaker labels (v1)"]
+    meta = [f"Duration {hms(source['duration'], hours)}", f"Model {source['model']}",
+            f"{source['speaker_count']} speakers, detected and numbered" if source.get("speaker_count") else "No speaker labels"]
     if source["url"]:
         lines.append(f"Source: {source['url']}  ")
     lines += [" · ".join(meta), ""]
     for r, sec in zip(sec_records, secs):
         lines += [f"## {r['index']}. [{r['start_hms']}–{r['end_hms']}]" + (f" {r['title']}" if r.get("title") else ""), ""]
         for para in paragraphs(sec):
-            lines += [f"[{hms(para[0]['start'], hours)}] " + " ".join(s["text"] for s in para), ""]
+            label = f"**Speaker {para[0]['speaker'] + 1}:** " if para[0].get("speaker") is not None else ""
+            lines += [f"[{hms(para[0]['start'], hours)}] {label}" + " ".join(s["text"] for s in para), ""]
     (out_dir / "transcript.md").write_text("\n".join(lines).rstrip() + "\n")
     (out_dir / "source.json").write_text(json.dumps(source, indent=2, ensure_ascii=False) + "\n")
 
@@ -496,6 +538,8 @@ def main() -> None:
     ap.add_argument("--video", action="store_true", help="keep the video too (720p) so render can grab frames")
     ap.add_argument("--no-chapters", action="store_true", help="ignore the creator's chapter marks")
     ap.add_argument("--no-glossary", action="store_true", help="skip glossary rules (to see what Whisper said raw)")
+    ap.add_argument("--speakers", nargs="?", const=-1, type=int, default=None, metavar="N",
+                    help="label speakers (numbered, not named); give N when you know how many")
     ap.add_argument("--quiet", action="store_true")
     a = ap.parse_args()
     if a.quiet:
@@ -526,6 +570,17 @@ def main() -> None:
     to_wav(media, wav, a.force, timer)
     model = Path(a.model).expanduser()
     raw = whisper(wav, out_dir / "whisper", model, a.lang, a.threads, a.force, timer)
+    turns: list[dict] = []
+    if a.speakers is not None:
+        dz = out_dir / "speakers.json"
+        if dz.exists() and not a.force:
+            log("  speakers: skipped, have speakers.json")
+        else:
+            def diarize():
+                cmd = [str(HERE / "diarize"), str(wav)] + (["--speakers", str(a.speakers)] if a.speakers > 0 else [])
+                dz.write_text(run(cmd, capture_output=True).stdout)
+            timer.step("speakers", diarize)
+        turns = json.loads(dz.read_text())
 
     def post():
         words, dropped = words_from_whisper(raw)
@@ -543,6 +598,8 @@ def main() -> None:
             if not n:
                 break
         words = tidy(words)
+        if turns:
+            assign_speakers(words, turns)
         sents = sentences(words)
         if len(source.get("chapters") or []) >= 2 and not a.no_chapters:
             secs = sections_from_chapters(sents, source["chapters"], a.section_target, a.section_min, a.section_max)
@@ -562,7 +619,8 @@ def main() -> None:
     timings.update(timer.t)
     timings["total"] = round(sum(v for k, v in timings.items() if k != "total"), 1)
     source.update({
-        "model": model.stem.replace("ggml-", ""), "language": a.lang, "speaker_labels": False,
+        "model": model.stem.replace("ggml-", ""), "language": a.lang, "speaker_labels": bool(turns),
+        "speaker_count": len({t["speaker"] for t in turns}) if turns else 0,
         "created_at": dt.datetime.now().astimezone().isoformat(timespec="seconds"),
         "word_count": len(words), "section_count": len(secs), "cleanup": cleanup,
         "timings_seconds": timings,

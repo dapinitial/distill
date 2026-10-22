@@ -1,0 +1,75 @@
+#!/usr/bin/env python3
+"""diarize: who spoke when, as JSON segments. Runs inside the repo's .venv (sherpa-onnx, CPU).
+
+  diarize <audio.wav 16 kHz mono> [--speakers N] [--threshold 0.5]
+
+Prints [{"start": s, "end": s, "speaker": 0}, ...]. Speakers are numbered by first appearance,
+never named. Models: pyannote segmentation 3.0 + NeMo TitaNet-small embeddings, both ONNX,
+downloaded by bin/setup into $DISTILL_MODELS. --speakers N fixes the count when you know it.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import wave
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+MODELS = Path(os.environ.get("DISTILL_MODELS", HERE.parent / "models"))
+VENV_PY = HERE.parent / ".venv" / "bin" / "python"
+
+if VENV_PY.exists() and Path(sys.prefix).resolve() != VENV_PY.parent.parent.resolve():
+    os.execv(str(VENV_PY), [str(VENV_PY), __file__] + sys.argv[1:])
+
+try:
+    import numpy as np
+    import sherpa_onnx
+except ImportError:
+    sys.exit("diarize: sherpa-onnx not installed; run bin/setup --speakers")
+
+
+def read_wav(path: Path) -> tuple[np.ndarray, int]:
+    with wave.open(str(path), "rb") as w:
+        assert w.getnchannels() == 1 and w.getsampwidth() == 2, "need 16-bit mono wav (transcribe makes one)"
+        sr = w.getframerate()
+        data = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16).astype(np.float32) / 32768.0
+    return data, sr
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("wav")
+    ap.add_argument("--speakers", type=int, default=-1, help="known number of speakers (default: detect)")
+    ap.add_argument("--threshold", type=float, default=0.5, help="clustering threshold when detecting; lower = more speakers")
+    a = ap.parse_args()
+    seg = MODELS / "sherpa-onnx-pyannote-segmentation-3-0" / "model.onnx"
+    emb = MODELS / "nemo_en_titanet_small.onnx"
+    for m in (seg, emb):
+        if not m.exists():
+            sys.exit(f"diarize: model missing: {m} (run bin/setup --speakers)")
+    config = sherpa_onnx.OfflineSpeakerDiarizationConfig(
+        segmentation=sherpa_onnx.OfflineSpeakerSegmentationModelConfig(
+            pyannote=sherpa_onnx.OfflineSpeakerSegmentationPyannoteModelConfig(model=str(seg)), num_threads=4),
+        embedding=sherpa_onnx.SpeakerEmbeddingExtractorConfig(model=str(emb), num_threads=4),
+        clustering=sherpa_onnx.FastClusteringConfig(num_clusters=a.speakers, threshold=a.threshold),
+        min_duration_on=0.3, min_duration_off=0.5)
+    if not config.validate():
+        sys.exit("diarize: invalid config")
+    sd = sherpa_onnx.OfflineSpeakerDiarization(config)
+    audio, sr = read_wav(Path(a.wav))
+    if sr != sd.sample_rate:
+        sys.exit(f"diarize: wav is {sr} Hz, model wants {sd.sample_rate}")
+    result = sd.process(audio).sort_by_start_time()
+    order: dict[int, int] = {}
+    out = []
+    for r in result:
+        order.setdefault(r.speaker, len(order))
+        out.append({"start": round(r.start, 2), "end": round(r.end, 2), "speaker": order[r.speaker]})
+    json.dump(out, sys.stdout)
+    print()
+
+
+if __name__ == "__main__":
+    main()

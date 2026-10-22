@@ -165,11 +165,12 @@ def transcript_html(md: str, url_base: str | None, hours: bool, frames: dict[int
                 out.append(f'<a class="frame" data-t="{int(parse_hms(a))}" href="{esc((url_base + "&t=" + str(int(parse_hms(a)))) if url_base else "#t-" + str(int(parse_hms(a))))}"'
                            f'{" target=_blank rel=noopener" if url_base else ""}><img src="{fr}" alt="frame at {esc(a)}" loading="lazy"></a>')
             open_sec = True
-        elif m := re.match(rf"^\[({TS})\] (.*)$", line):
+        elif m := re.match(rf"^\[({TS})\] (?:\*\*(Speaker \d+):\*\* )?(.*)$", line):
             t = parse_hms(m.group(1))
             paras.append({"t": t})
+            spk = f'<b class="spk">{esc(m.group(2))}</b> ' if m.group(2) else ""
             out.append(f'<p class="para" id="t-{int(t)}" data-t="{int(t)}">{ts_anchor(m.group(1), t, url_base)} '
-                       f'<span class="txt">{esc(m.group(2))}</span></p>')
+                       f'{spk}<span class="txt">{esc(m.group(3))}</span></p>')
     if open_sec:
         out.append("</section>")
     return "\n".join(out), paras
@@ -232,6 +233,7 @@ button:focus-visible, a:focus-visible, input:focus-visible { outline: 2px solid 
 .para .ts { display: inline-block; min-width: 3.6em; margin-right: 6px }
 .frame { display: block; margin: 4px 0 10px; max-width: 360px } .frame img { width: 100%; border-radius: 4px; border: 1px solid var(--line); display: block }
 .frame.small { max-width: 240px; float: right; margin: 0 0 6px 10px } .notes li:has(.frame.small) { overflow: hidden }
+.spk { color: var(--muted); font-weight: 600; font-size: .85rem; margin-right: 4px }
 mark { background: var(--mark); color: inherit; border-radius: 2px; padding: 0 1px }
 .toast { position: fixed; left: 50%; bottom: calc(24px + env(safe-area-inset-bottom, 0px)); transform: translateX(-50%); background: var(--fg); color: var(--bg); padding: 8px 14px; border-radius: 6px; font-size: .9rem; opacity: 0; transition: opacity .2s; pointer-events: none }
 .toast.show { opacity: 1 }

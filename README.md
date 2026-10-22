@@ -81,7 +81,8 @@ Each transcript folder holds:
 | `library` | `out/index.md` and `out/index.html`: every transcript with its date, length, the point, and links |
 | `glossary-suggest` | three deterministic signals for misheard names: spelling clusters, disagreements with YouTube's captions, low-confidence words |
 | `distill-batch` | queue runner for unattended transcribe → cliffnotes → verify → library |
-| `test` | regression checks for the cleanup rules, sectioning and verify-quotes |
+| `test` | regression checks for the cleanup rules, sectioning, speakers and verify-quotes |
+| `diarize` | who spoke when, as JSON; used by `transcribe --speakers` |
 
 ## Sections
 
@@ -93,6 +94,15 @@ Otherwise sections are cut at the longest pause between 90 seconds and 5 minutes
 
 Whitespace, fillers (`um`, `uh`), doubled words and phrases, and Whisper's hallucinated credits on silent intros are handled by fixed rules in `bin/transcribe`. Names and jargon come from `glossary.txt`: one preferred spelling per line, or `wrong → right`. The repo glossary is merged with a `glossary.txt` in the current directory, so each project can keep its own. Because the transcript is a deterministic product, `verify-quotes` can hold the cliff notes to it word for word.
 
-## v1 limits
+## Speaker labels
 
-No speaker labels. English by default (`--lang auto` works, cleanup rules are tuned for English). Word times are Whisper's token offsets, accurate to about a second.
+```bash
+bin/setup --speakers                 # once: sherpa-onnx in .venv (needs cmake), two small ONNX models
+transcribe meeting.m4a --speakers    # or --speakers 3 when you know the count
+```
+
+Speakers are detected locally (pyannote segmentation + TitaNet embeddings via sherpa-onnx, CPU, about a tenth of real time) and numbered in order of first appearance, never named. Paragraphs break on every speaker change and carry `**Speaker N:**`; `chunks.jsonl` text has the same labels inline. Words right at a turn boundary can land on the wrong side by a word or two, since Whisper's word times are only accurate to about a second. For meetings, the cliffnotes skill writes `meeting.md` (decisions, action items, open questions, timeline) instead of cliff notes.
+
+## Limits
+
+English by default (`--lang auto` works, cleanup rules are tuned for English). Word times are Whisper's token offsets, accurate to about a second. Speaker detection is not run unless you ask for it.

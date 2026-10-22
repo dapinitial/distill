@@ -1,6 +1,6 @@
 ---
 name: cliffnotes
-description: Turn a long video, podcast or talk into a five-minute read — the point, the argument with timestamped links, verbatim quotes verified against the transcript, decisions and numbers, and what's worth watching vs. safe to skip. Takes a transcript folder from /transcribe, or a file or link (it transcribes first). Use when the user says "cliff notes", "summarize this video", "TL;DW", "what's the gist of this talk", "do I need to watch this".
+description: Turn a long video, podcast, talk or meeting recording into a five-minute read — the point, the argument with timestamped links, verbatim quotes verified against the transcript, decisions and numbers, and what's worth watching vs. safe to skip. Takes a transcript folder from /transcribe, or a file or link (it transcribes first). Use when the user says "cliff notes", "summarize this video", "TL;DW", "what's the gist of this talk", "do I need to watch this".
 ---
 
 # /cliffnotes — transcript (or file or link) → cliffnotes.md
@@ -88,8 +88,9 @@ Rules:
 - Prefer the speaker's structure over yours. Keep the order they made the argument in.
 - Treat `low_confidence_words` and anything in the first/last 20 seconds with suspicion;
   don't build a quote on them.
-- No speaker labels exist in v1; if two people talk, say "the host" / "the guest" from context
-  and note that attribution is inferred.
+- Speaker labels exist only when transcribe ran with `--speakers` (numbered, not named). Without
+  them, if two people talk, say "the host" / "the guest" from context and note that attribution
+  is inferred. For meetings, ask for `--speakers` (or run `transcribe <file> --speakers`).
 
 ## 3b. Meeting mode
 

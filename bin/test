@@ -95,6 +95,13 @@ chapters = [{"title": "A", "start": 0, "end": 100}, {"title": "B", "start": 100,
 secs = T["sections_from_chapters"](T["sentences"](long), chapters, 180, 90, 300)
 check("chapter marks become section starts with titles", [(round(s[0]["start"]), s[0].get("chapter")) for s in secs][:2], [(0, "A"), (100, "B")])
 
+ws = W("hello there friend. yes indeed. back again now", gap=1.0)
+T["assign_speakers"](ws, [{"start": 0, "end": 2.9, "speaker": 0}, {"start": 3.0, "end": 4.9, "speaker": 1}, {"start": 5.0, "end": 8, "speaker": 0}])
+check("speakers assigned by overlap", [w["speaker"] for w in ws], [0, 0, 0, 1, 1, 0, 0, 0])
+ss = T["sentences"](ws)
+check("sentences carry a speaker and break on change", [(x["text"], x["speaker"]) for x in ss], [("hello there friend.", 0), ("yes indeed.", 1), ("back again now", 0)])
+check("labelled text marks speaker changes", T["labelled"](ss), "Speaker 1: hello there friend. Speaker 2: yes indeed. Speaker 1: back again now")
+
 # --- helpers -----------------------------------------------------------------------------------
 check("hms", (hms(5), hms(754), hms(3725)), ("00:05", "12:34", "1:02:05"))
 check("parse_hms", (parse_hms("12:34"), parse_hms("1:02:05")), (754.0, 3725.0))
