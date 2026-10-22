@@ -7,7 +7,7 @@ Two Claude Code skills that chain:
 - **transcribe**: a file or a link → an LLM-ready transcript. Local Whisper (whisper.cpp, large-v3-turbo on Metal), word-level timestamps, deterministic cleanup with a glossary, sections split at natural pauses.
 - **cliffnotes**: a transcript (or a file or link, which it transcribes first) → a five-minute read: the point, the meat with timestamps that jump into the video, exact quotes verified against the transcript, decisions and numbers, what's worth watching and what's safe to skip.
 
-Everything runs on this Mac. Nothing is uploaded.
+Transcription and cleanup run on this Mac. The only thing that leaves it is the rendered page, if you choose to publish it as a private Claude Artifact.
 
 ## Setup
 
@@ -48,6 +48,8 @@ Each transcript folder holds:
 | `chunks.jsonl` | one section per line, for section-by-section summarizing |
 | `source.json` | title, URL, duration, model, cleanup stats, step timings |
 | `cliffnotes.md` | written by the cliffnotes skill |
+| `sections.md` | per-section notes written first for long videos |
+| `index.html` / `local.html` | the rendered page (`render`); `index.html` is what gets published as a Claude Artifact |
 
 ## Scripts (`bin/`)
 
@@ -58,6 +60,7 @@ Each transcript folder holds:
 | `verify-quotes` | proves every quoted span in `cliffnotes.md` is verbatim and every timestamp is inside the video; exit 1 on any failure, with a hint on how to fix each |
 | `where` | find when a phrase was said, printed as a timestamp link |
 | `stamp` | turn `7:49` or `469` into the `[07:49](…&t=469)` marker |
+| `render` | one self-contained HTML page per transcript: notes beside the transcript, search, timestamp links. `--open` adds an embedded player (YouTube or the local audio) that seeks from any timestamp and highlights the paragraph being spoken |
 
 ## Cleanup is code, not a model
 

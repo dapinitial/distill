@@ -102,7 +102,24 @@ For each FAIL it prints what to do (the real time, or the closest wording it fou
 line or drop it, rerun, and only report the notes when it exits 0. Paste the final summary line
 (`N quotes verified, 0 failed`) in your reply.
 
-## 5. Show the notes
+## 5. Render and publish the page
+
+```bash
+render <folder>            # <folder>/index.html, an Artifact-ready fragment
+render <folder> --open     # local.html with an embedded player; opens in the browser
+```
+
+The page puts the cliff notes beside the full transcript: section jump list, search, every
+timestamp a link into the video, and a "Copy selection for Claude" button that copies the
+highlighted text as a quote with its timestamp and folder path, ready to paste into Claude Code.
+
+Publish `index.html` with the Artifact tool (`file_path` = the folder's index.html, `icon`
+"transcript", a one-sentence `description`). The artifact is private to the user's account and
+becomes the shareable, navigable view; the markdown folder stays the source of truth. Leave a
+comment on the artifact and the publishing session sees it, so a viewer can ask about a passage
+from the page itself. Report the artifact link with the notes.
+
+## 6. Show the notes
 
 Print `cliffnotes.md` in full in your reply (it is short by design), with the folder path and
 the step timings from `source.json → timings_seconds` if you ran transcribe.

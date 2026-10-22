@@ -1,0 +1,384 @@
+#!/usr/bin/env python3
+"""render: a transcript folder -> one self-contained HTML page (notes beside the transcript).
+
+  render <transcript folder> [--standalone] [--open]
+
+Default output is an Artifact-ready fragment (no <html>/<head>/<body>; the Artifact tool wraps
+it), written to <folder>/index.html. --standalone writes a complete document with an embedded
+player (YouTube, or the local audio file) so timestamps seek and the spoken paragraph lights up;
+--open opens that in the default browser. Every timestamp is also a plain link, so the page works
+with no player at all.
+"""
+from __future__ import annotations
+
+import argparse
+import html
+import json
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from distill_common import find_transcript_dir, hms, load_transcript, parse_hms, youtube_id  # noqa: E402
+
+TS = r"\d{1,2}:\d{2}(?::\d{2})?"
+LINK_TS = re.compile(rf"\[({TS})(?:\s*[-–]\s*({TS}))?\]\((https?://[^)\s]+)\)")
+BARE_TS = re.compile(rf"\[({TS})(?:\s*[-–]\s*({TS}))?\](?!\()")
+INLINE_LINK = re.compile(r"\[([^\]]+)\]\((https?://[^)\s]+)\)")
+
+
+def esc(s: str) -> str:
+    return html.escape(s, quote=True)
+
+
+def ts_anchor(label: str, secs: float, url_base: str | None, end: str | None = None) -> str:
+    text = label + (f"–{end}" if end else "")
+    href = f"{url_base}&t={int(secs)}" if url_base else f"#t-{int(secs)}"
+    target = ' target="_blank" rel="noopener"' if url_base else ""
+    return f'<a class="ts" data-t="{int(secs)}" href="{esc(href)}"{target}>{esc(text)}</a>'
+
+
+def inline(md: str, url_base: str | None) -> str:
+    """Inline markdown: timestamps first (they become seek links), then links, bold, code."""
+    out, pos = [], 0
+    for m in re.finditer(rf"{LINK_TS.pattern}|{BARE_TS.pattern}|{INLINE_LINK.pattern}|`[^`]+`|\*\*[^*]+\*\*", md):
+        out.append(esc(md[pos:m.start()]))
+        s = m.group(0)
+        if lm := LINK_TS.fullmatch(s):
+            out.append(ts_anchor(lm.group(1), parse_hms(lm.group(1)), url_base, lm.group(2)))
+        elif bm := BARE_TS.fullmatch(s):
+            out.append(ts_anchor(bm.group(1), parse_hms(bm.group(1)), url_base, bm.group(2)))
+        elif im := INLINE_LINK.fullmatch(s):
+            out.append(f'<a href="{esc(im.group(2))}" target="_blank" rel="noopener">{esc(im.group(1))}</a>')
+        elif s.startswith("`"):
+            out.append(f"<code>{esc(s[1:-1])}</code>")
+        else:
+            out.append(f"<strong>{esc(s[2:-2])}</strong>")
+        pos = m.end()
+    out.append(esc(md[pos:]))
+    return "".join(out)
+
+
+def md_to_html(md: str, url_base: str | None) -> str:
+    """Enough markdown for cliffnotes.md: headings, nested bullets, blockquotes, hr, paragraphs."""
+    out: list[str] = []
+    stack: list[int] = []  # open <ul> indents
+    para: list[str] = []
+
+    def flush_para():
+        if para:
+            out.append(f"<p>{inline(' '.join(para), url_base)}</p>")
+            para.clear()
+
+    def close_lists(to_indent: int = -1):
+        while stack and stack[-1] > to_indent:
+            out.append("</li></ul>")
+            stack.pop()
+
+    for raw in md.splitlines():
+        line = raw.rstrip()
+        if not line.strip():
+            flush_para(); close_lists(); continue
+        if m := re.match(r"^(#{1,6})\s+(.*)$", line):
+            flush_para(); close_lists()
+            lvl = max(2, min(len(m.group(1)), 4))  # the page's own h1 is the title
+            text = m.group(2)
+            if lvl == 2:
+                out.append(f'<h2 id="{esc(slug_id(text))}">{inline(text, url_base)}</h2>')
+            else:
+                out.append(f"<h{lvl}>{inline(text, url_base)}</h{lvl}>")
+            continue
+        if re.match(r"^-{3,}$", line):
+            flush_para(); close_lists(); out.append("<hr>"); continue
+        if m := re.match(r"^>\s?(.*)$", line):
+            flush_para(); close_lists()
+            out.append(f"<blockquote>{inline(m.group(1), url_base)}</blockquote>")
+            continue
+        if m := re.match(r"^(\s*)[-*]\s+(.*)$", line):
+            flush_para()
+            indent = len(m.group(1))
+            if not stack or indent > stack[-1]:
+                out.append("<ul>"); stack.append(indent)
+            else:
+                close_lists(indent)
+                if not stack or stack[-1] != indent:
+                    out.append("<ul>"); stack.append(indent)
+                else:
+                    out.append("</li>")
+            out.append(f"<li>{inline(m.group(2), url_base)}")
+            continue
+        para.append(line.strip())
+    flush_para(); close_lists()
+    return "\n".join(out)
+
+
+def slug_id(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-") or "section"
+
+
+def transcript_html(md: str, url_base: str | None, hours: bool) -> tuple[str, list[dict]]:
+    """Sections and paragraphs from transcript.md. Returns (html, paragraph starts)."""
+    out: list[str] = []
+    paras: list[dict] = []
+    open_sec = False
+    for line in md.splitlines():
+        if m := re.match(rf"^## (\d+)\. \[({TS})[-–]({TS})\]", line):
+            if open_sec:
+                out.append("</section>")
+            n, a, b = m.group(1), m.group(2), m.group(3)
+            out.append(f'<section id="s-{n}"><h3><span class="n">{n}</span> {ts_anchor(a, parse_hms(a), url_base)} – '
+                       f'{ts_anchor(b, parse_hms(b), url_base)} <span class="dur">{hms(parse_hms(b) - parse_hms(a))}</span></h3>')
+            open_sec = True
+        elif m := re.match(rf"^\[({TS})\] (.*)$", line):
+            t = parse_hms(m.group(1))
+            paras.append({"t": t})
+            out.append(f'<p class="para" id="t-{int(t)}" data-t="{int(t)}">{ts_anchor(m.group(1), t, url_base)} '
+                       f'<span class="txt">{esc(m.group(2))}</span></p>')
+    if open_sec:
+        out.append("</section>")
+    return "\n".join(out), paras
+
+
+CSS = """
+<style>
+/* Layout: a reading desk. Notes in a sticky rail on the left, the transcript as the long scroll on the right,
+   one quiet accent for anything that seeks the recording. */
+:root {
+  --bg: #f5f6f8; --panel: #ffffff; --fg: #1c2029; --muted: #6a7282; --line: #dfe3ea;
+  --accent: #0d6b70; --accent-ink: #ffffff; --now: #fff2b8; --mark: #ffe08a;
+  --display: "IBM Plex Serif", Georgia, "Times New Roman", serif;
+  --body: "IBM Plex Sans", -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #13161d; --panel: #1b1f28; --fg: #e4e7ee; --muted: #949caf; --line: #2b313d;
+  --accent: #5cc8cc; --accent-ink: #0d1014; --now: #3a3416; --mark: #6b5a12; color-scheme: dark } }
+:root[data-theme="dark"] {
+  --bg: #13161d; --panel: #1b1f28; --fg: #e4e7ee; --muted: #949caf; --line: #2b313d;
+  --accent: #5cc8cc; --accent-ink: #0d1014; --now: #3a3416; --mark: #6b5a12; color-scheme: dark }
+*, *::before, *::after { box-sizing: border-box }
+body { background: var(--bg); color: var(--fg); font: 16px/1.55 var(--body); margin: 0;
+  padding-block: 0 48px; padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)) }
+a { color: var(--accent) }
+header.top { max-width: 1280px; margin: 0 auto; padding-block: 28px 16px; border-bottom: 1px solid var(--line) }
+header.top h1 { font: 600 clamp(1.5rem, 2.6vw, 2.1rem)/1.2 var(--display); margin: 0 0 8px; text-wrap: balance }
+.meta { color: var(--muted); font-size: .9rem; display: flex; flex-wrap: wrap; gap: 6px 18px; align-items: center }
+.meta a { color: inherit }
+.player { max-width: 1280px; margin: 16px auto 0 } .player iframe { max-width: 760px }
+.player iframe, .player audio { width: 100%; max-width: 100%; border: 0; border-radius: 6px; background: #000 }
+.player iframe { aspect-ratio: 16 / 9 }
+.wrap { max-width: 1280px; margin: 0 auto; display: grid; grid-template-columns: minmax(0, 5fr) minmax(0, 7fr); gap: 32px; align-items: start }
+.notes { position: sticky; top: env(safe-area-inset-top, 0px); max-height: calc(100vh - env(safe-area-inset-top, 0px)); overflow: auto; padding-block: 20px 24px; min-width: 0 }
+.notes h2 { font: 600 .8rem/1 var(--body); letter-spacing: .08em; text-transform: uppercase; color: var(--muted); margin: 26px 0 10px; padding-top: 14px; border-top: 1px solid var(--line) }
+.notes h2:first-of-type { border-top: 0; margin-top: 8px }
+.notes p { margin: 0 0 10px; max-width: 65ch }
+.notes ul { padding-left: 1.1rem; margin: 0 0 8px } .notes li { margin: 4px 0 } .notes ul ul { margin-top: 2px }
+.notes blockquote { margin: 10px 0; padding: 10px 14px; border-left: 3px solid var(--accent); background: var(--panel); font-family: var(--display); font-size: 1.02rem }
+.notes hr { border: 0; border-top: 1px solid var(--line); margin: 20px 0 } .notes hr + p { color: var(--muted); font-size: .85rem }
+.toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding-block: 14px; position: sticky; top: env(safe-area-inset-top, 0px); background: var(--bg); z-index: 2; border-bottom: 1px solid var(--line) }
+.toolbar input[type=search] { flex: 1 1 180px; min-width: 0; font: inherit; font-size: .95rem; padding: 7px 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); color: var(--fg) }
+.toolbar label { font-size: .85rem; color: var(--muted); display: inline-flex; gap: 6px; align-items: center }
+button { font: inherit; font-size: .85rem; padding: 7px 11px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); color: var(--fg); cursor: pointer }
+button.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent) }
+button:focus-visible, a:focus-visible, input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px }
+.count { font-size: .85rem; color: var(--muted); font-variant-numeric: tabular-nums }
+.transcript { min-width: 0 }
+.transcript section { padding-block: 14px 6px }
+.transcript h3 { font: 500 .95rem/1.3 var(--body); margin: 10px 0 4px; display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; color: var(--muted) }
+.transcript h3 .n { font: 600 .75rem/1 var(--mono); color: var(--accent); border: 1px solid var(--accent); border-radius: 4px; padding: 3px 5px }
+.transcript h3 .dur { font: .8rem var(--mono); margin-left: auto }
+.para { margin: 0 0 14px; padding: 8px 10px 8px 12px; border-left: 3px solid transparent; border-radius: 4px; max-width: 78ch; scroll-margin-top: 90px }
+.para.now { background: var(--now); border-left-color: var(--accent) }
+.para.hit { border-left-color: var(--line) }
+.ts { font: .8rem/1 var(--mono); color: var(--accent); text-decoration: none; white-space: nowrap; font-variant-numeric: tabular-nums }
+.ts:hover { text-decoration: underline }
+.para .ts { display: inline-block; min-width: 3.6em; margin-right: 6px }
+mark { background: var(--mark); color: inherit; border-radius: 2px; padding: 0 1px }
+.toast { position: fixed; left: 50%; bottom: calc(24px + env(safe-area-inset-bottom, 0px)); transform: translateX(-50%); background: var(--fg); color: var(--bg); padding: 8px 14px; border-radius: 6px; font-size: .9rem; opacity: 0; transition: opacity .2s; pointer-events: none }
+.toast.show { opacity: 1 }
+@media (max-width: 900px) {
+  .wrap { grid-template-columns: 1fr; gap: 0 }
+  .notes { position: static; max-height: none; border-bottom: 1px solid var(--line) }
+}
+@media (prefers-reduced-motion: reduce) { .toast { transition: none } }
+</style>
+"""
+
+JS = r"""
+<script>
+(function () {
+  var paras = Array.prototype.slice.call(document.querySelectorAll('.para'));
+  var starts = paras.map(function (p) { return +p.dataset.t; });
+  var player = null, playerKind = null, follow = document.getElementById('follow');
+  var toast = document.getElementById('toast'); var toastTimer;
+  function say(msg) { toast.textContent = msg; toast.classList.add('show'); clearTimeout(toastTimer); toastTimer = setTimeout(function () { toast.classList.remove('show'); }, 1600); }
+  function fmt(s) { s = Math.round(s); var h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60), x = s % 60; var mm = (h ? String(m).padStart(2, '0') : String(m).padStart(2, '0')) + ':' + String(x).padStart(2, '0'); return h ? h + ':' + mm : mm; }
+
+  // Player: YouTube iframe via postMessage (no external script), or a local <audio>.
+  var yt = document.getElementById('yt'); var audio = document.getElementById('audio');
+  if (yt) {
+    playerKind = 'yt'; player = yt;
+    yt.addEventListener('load', function () { yt.contentWindow.postMessage(JSON.stringify({event: 'listening', id: 1, channel: 'widget'}), '*'); });
+    window.addEventListener('message', function (e) {
+      if (typeof e.data !== 'string') return; var d; try { d = JSON.parse(e.data); } catch (_) { return; }
+      if (d.event === 'infoDelivery' && d.info && typeof d.info.currentTime === 'number') tick(d.info.currentTime);
+    });
+  } else if (audio) { playerKind = 'audio'; player = audio; audio.addEventListener('timeupdate', function () { tick(audio.currentTime); }); }
+  function seek(t) {
+    if (playerKind === 'yt') { yt.contentWindow.postMessage(JSON.stringify({event: 'command', func: 'seekTo', args: [t, true]}), '*'); yt.contentWindow.postMessage(JSON.stringify({event: 'command', func: 'playVideo', args: []}), '*'); }
+    else if (playerKind === 'audio') { audio.currentTime = t; audio.play().catch(function () {}); }
+    light(t, true);
+  }
+  var lastIdx = -1;
+  function idxFor(t) { var i = 0; while (i + 1 < starts.length && starts[i + 1] <= t) i++; return starts.length && starts[0] <= t ? i : -1; }
+  function light(t, force) {
+    var i = idxFor(t); if (i === lastIdx && !force) return;
+    if (lastIdx >= 0) paras[lastIdx].classList.remove('now');
+    lastIdx = i; if (i < 0) return; paras[i].classList.add('now');
+    if (follow && follow.checked || force) paras[i].scrollIntoView({block: 'center', behavior: 'smooth'});
+  }
+  function tick(t) { light(t, false); }
+
+  // Timestamp links seek when a player exists; otherwise they are plain links (YouTube at &t=, or #t-N).
+  document.addEventListener('click', function (e) {
+    var a = e.target.closest && e.target.closest('a.ts'); if (!a) return;
+    var t = +a.dataset.t;
+    if (player) { e.preventDefault(); seek(t); }
+    else if (a.getAttribute('href').charAt(0) === '#') { e.preventDefault(); var el = document.getElementById('t-' + t) || paras[Math.max(0, idxFor(t))]; if (el) { light(t, true); el.scrollIntoView({block: 'center'}); } }
+  });
+  // Deep link: #t-305 or #s-3
+  var h = location.hash.slice(1), m = /^t-(\d+)$/.exec(h);
+  if (m) { setTimeout(function () { light(+m[1], true); }, 50); }
+
+  // Search: hide paragraphs without a hit, mark the hits.
+  var q = document.getElementById('q'), count = document.getElementById('count');
+  var texts = paras.map(function (p) { return p.querySelector('.txt'); });
+  var originals = texts.map(function (s) { return s.textContent; });
+  function escRe(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+  function search() {
+    var v = q.value.trim(), re = v.length > 1 ? new RegExp(escRe(v), 'ig') : null, n = 0;
+    texts.forEach(function (s, i) {
+      var hit = re && re.test(originals[i]); re && (re.lastIndex = 0);
+      paras[i].hidden = !!re && !hit; paras[i].classList.toggle('hit', !!hit);
+      if (re && hit) { n++; s.innerHTML = originals[i].replace(/[&<>]/g, function (c) { return {'&': '&amp;', '<': '&lt;', '>': '&gt;'}[c]; }).replace(re, function (x) { return '<mark>' + x + '</mark>'; }); }
+      else if (s.innerHTML !== originals[i]) s.textContent = originals[i];
+    });
+    document.querySelectorAll('.transcript section').forEach(function (sec) { sec.hidden = !!re && !sec.querySelector('.para:not([hidden])'); });
+    count.textContent = re ? n + ' of ' + paras.length + ' paragraphs' : paras.length + ' paragraphs';
+  }
+  if (q) { q.addEventListener('input', search); search(); }
+
+  // Copy: the selection (with its timestamp link and the folder) or the whole notes file as markdown.
+  var SRC = window.DISTILL;
+  function copy(text, label) {
+    function fallback() { var ta = document.createElement('textarea'); ta.value = text; document.body.appendChild(ta); ta.select(); try { document.execCommand('copy'); say(label); } catch (_) { say('Copy failed; select and copy by hand'); } ta.remove(); }
+    if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(text).then(function () { say(label); }, fallback); else fallback();
+  }
+  function stampFor(node) { var p = node && node.nodeType === 1 ? node : node && node.parentElement; var para = p && p.closest ? p.closest('.para') : null; return para ? +para.dataset.t : null; }
+  document.getElementById('copy-sel').addEventListener('click', function () {
+    var sel = window.getSelection(); var text = sel ? String(sel).trim() : '';
+    if (!text) { say('Select some text first'); return; }
+    var t = stampFor(sel.anchorNode); var where = t === null ? '' : ' [' + fmt(t) + '](' + (SRC.url ? SRC.url + '&t=' + t : '#t-' + t) + ')';
+    copy('> "' + text + '"' + where + '\n\nFrom ' + SRC.title + ' (' + SRC.folder + ')\n\nQuestion: ', 'Copied with timestamp. Paste into Claude Code.');
+  });
+  var cn = document.getElementById('copy-notes'); if (cn) cn.addEventListener('click', function () { copy(SRC.notes, 'Cliff notes copied as markdown'); });
+})();
+</script>
+"""
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("folder")
+    ap.add_argument("--standalone", action="store_true", help="complete HTML document with an embedded player")
+    ap.add_argument("--open", action="store_true", help="imply --standalone and open the page")
+    ap.add_argument("--out", help="output path (default <folder>/index.html)")
+    a = ap.parse_args()
+    standalone = a.standalone or a.open
+    folder = find_transcript_dir(a.folder)
+    data = load_transcript(folder)
+    src = data.get("source") or {}
+    title = src.get("title") or data.get("title") or folder.name
+    url = src.get("url")
+    vid = youtube_id(url)
+    url_base = f"https://www.youtube.com/watch?v={vid}" if vid else None
+    duration = float(src.get("duration") or data.get("duration") or 0)
+    hours = duration >= 3600
+    notes_md = (folder / "cliffnotes.md").read_text() if (folder / "cliffnotes.md").exists() else ""
+    transcript_md = (folder / "transcript.md").read_text()
+    # drop the transcript's own title/meta lines; the page has its own header
+    body_md = transcript_md.split("\n## ", 1)
+    transcript_md = "## " + body_md[1] if len(body_md) == 2 else transcript_md
+    # notes: drop the H1 and the source line, which the page header already shows
+    notes_lines = [ln for ln in notes_md.splitlines() if not ln.startswith("# ")]
+    if notes_lines and notes_lines[0].strip() == "":
+        notes_lines = notes_lines[1:]
+    if notes_lines and ("·" in notes_lines[0] or "http" in notes_lines[0]) and not notes_lines[0].startswith(("#", "-", ">")):
+        notes_lines = notes_lines[1:]
+    notes_html = md_to_html("\n".join(notes_lines), url_base) if notes_md else \
+        "<p>No cliff notes yet. Run the cliffnotes skill on this folder.</p>"
+    t_html, paras = transcript_html(transcript_md, url_base, hours)
+
+    meta = [f"<span>{hms(duration, hours)}</span>", f"<span>{len(data['words']):,} words</span>",
+            f"<span>{len(paras)} paragraphs</span>", f"<span>{esc(src.get('model', 'whisper'))}</span>", "<span>no speaker labels</span>"]
+    if url:
+        meta.insert(0, f'<a href="{esc(url)}" target="_blank" rel="noopener">{esc(src.get("uploader") or "source")} ↗</a>')
+    elif src.get("path"):
+        meta.insert(0, f"<span>{esc(Path(src['path']).name)}</span>")
+
+    player_html = ""
+    if standalone and vid:
+        player_html = f'<div class="player"><iframe id="yt" src="https://www.youtube.com/embed/{vid}?enablejsapi=1&rel=0" allow="autoplay; encrypted-media; picture-in-picture" allowfullscreen title="{esc(title)}"></iframe></div>'
+    elif standalone:
+        media = sorted((folder / "media").glob("audio.*")) if (folder / "media").exists() else []
+        src_file = media[0] if media else (folder / "audio.wav" if (folder / "audio.wav").exists() else None)
+        if src_file:
+            player_html = f'<div class="player"><audio id="audio" controls preload="metadata" src="{esc(src_file.relative_to(folder).as_posix())}"></audio></div>'
+    follow_html = '<label><input type="checkbox" id="follow" checked> Follow playback</label>' if player_html else ""
+
+    payload = json.dumps({"title": title, "url": url_base, "folder": str(folder), "notes": notes_md}, ensure_ascii=False)
+    payload = payload.replace("</", "<\\/")
+    page = f"""<title>{esc(title)}</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Serif:wght@400;600&family=IBM+Plex+Mono:wght@400;600&display=swap">
+{CSS}
+<header class="top">
+  <h1>{esc(title)}</h1>
+  <div class="meta">{' '.join(meta)}</div>
+</header>
+{player_html}
+<div class="wrap">
+  <aside class="notes" id="notes">
+    {notes_html}
+    {'<p><button id="copy-notes">Copy notes as markdown</button></p>' if notes_md else ''}
+  </aside>
+  <main class="transcript">
+    <div class="toolbar">
+      <input type="search" id="q" placeholder="Search the transcript" aria-label="Search the transcript">
+      <span class="count" id="count"></span>
+      {follow_html}
+      <button class="primary" id="copy-sel" title="Copy the selected text as a quote with its timestamp, ready to paste into Claude Code">Copy selection for Claude</button>
+    </div>
+    {t_html}
+  </main>
+</div>
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
+<script>window.DISTILL = {payload};</script>
+{JS}
+"""
+    if standalone:
+        page = f'<!doctype html>\n<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">\n{page}</head><body></body></html>'
+        # move body content: everything after </style>... simpler: browsers accept content before <body>; but be tidy:
+        head, rest = page.split("</style>\n", 1)
+        rest, tail = rest.rsplit("</head><body></body></html>", 1)
+        page = head + "</style>\n</head><body>\n" + rest + "\n</body></html>\n"
+    out = Path(a.out) if a.out else folder / ("index.html" if not standalone else "local.html")
+    out.write_text(page)
+    print(out)
+    if a.open:
+        subprocess.run(["open", str(out)])
+
+
+if __name__ == "__main__":
+    main()
