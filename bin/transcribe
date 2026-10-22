@@ -486,11 +486,16 @@ def main() -> None:
                              "low_confidence_words": low[:100], "low_confidence_count": len(low)}
 
     words, secs, cleanup = timer.step("cleanup+sections", post)
+    prev = out_dir / "source.json"  # cached steps keep the timing from the run that actually did them
+    timings = json.loads(prev.read_text()).get("timings_seconds", {}) if prev.exists() else {}
+    timings = {k: v for k, v in timings.items() if k != "total"}
+    timings.update(timer.t)
+    timings["total"] = round(sum(v for k, v in timings.items() if k != "total"), 1)
     source.update({
         "model": model.stem.replace("ggml-", ""), "language": a.lang, "speaker_labels": False,
         "created_at": dt.datetime.now().astimezone().isoformat(timespec="seconds"),
         "word_count": len(words), "section_count": len(secs), "cleanup": cleanup,
-        "timings_seconds": {**timer.t, "total": timer.total()},
+        "timings_seconds": timings,
     })
     write_outputs(out_dir, source, words, secs)
     for d in cleanup["dropped_suspect_segments"]:
@@ -498,7 +503,7 @@ def main() -> None:
     if cleanup["low_confidence_count"]:
         sample = ", ".join(f"{w['word']}@{w['at']}" for w in cleanup["low_confidence_words"][:8])
         log(f"  low-confidence words: {cleanup['low_confidence_count']} (see source.json), e.g. {sample}")
-    log(f"  done in {timer.total()}s: {len(words)} words, {len(secs)} sections, {hms(source['duration'])} of audio")
+    log(f"  done in {timer.total()}s (whole pipeline {timings['total']}s): {len(words)} words, {len(secs)} sections, {hms(source['duration'])} of audio")
     print(out_dir)
 
 
