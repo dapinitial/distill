@@ -1,0 +1,171 @@
+#!/usr/bin/env python3
+"""verify-quotes: prove every quote in a cliff-notes file is verbatim, and every timestamp is real.
+
+  verify-quotes <cliffnotes.md | transcript folder> [--tolerance 20] [--max-words 1100]
+
+Checks
+  * every double-quoted span of 4+ words (anywhere in the file) appears word for word in
+    transcript.json — punctuation, case and curly quotes are ignored; "..." marks an elision
+  * every [mm:ss] / [h:mm:ss] marker and every &t=SECONDS link falls inside the video
+  * a quote's own timestamp is within --tolerance seconds of where the words were spoken
+  * on one line, [mm:ss] and &t=SECONDS agree
+  * YouTube links point at the same video as source.json
+  * reading length: warns above --max-words
+Exit 0 when nothing failed. Prints OK / FAIL / WARN lines; FAIL lines say what to fix.
+"""
+from __future__ import annotations
+
+import argparse
+import difflib
+import re
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from distill_common import ascii_punct, find_transcript_dir, hms, load_transcript, norm_tokens, parse_hms, youtube_id  # noqa: E402
+
+QUOTE_RE = re.compile(r'"([^"\n]{8,}?)"')
+STAMP_RE = re.compile(r"\[(\d{1,2}:\d{2}(?::\d{2})?)\]")
+T_RE = re.compile(r"[?&]t=(\d+)s?\b")
+YT_RE = re.compile(r"youtu(?:\.be/|be\.com/(?:watch\?v=|shorts/|embed/))([A-Za-z0-9_-]{11})")
+MIN_QUOTE_WORDS = 4
+
+
+def find_all(hay: list[str], needle: list[str]) -> list[int]:
+    n = len(needle)
+    first = needle[0]
+    return [i for i in range(len(hay) - n + 1) if hay[i] == first and hay[i:i + n] == needle]
+
+
+def find_quote(hay: list[str], parts: list[list[str]], near: float | None, starts: list[float]) -> int | None:
+    """Return the index of the first word of the match, honouring '...' elisions (parts in order,
+    each within 90 s of the previous). Picks the occurrence nearest `near` seconds."""
+    cands = find_all(hay, parts[0])
+    if not cands:
+        return None
+    good = []
+    for c in cands:
+        pos = c + len(parts[0])
+        ok = True
+        for part in parts[1:]:
+            nxt = [i for i in find_all(hay, part) if i >= pos and starts[i] - starts[pos - 1] <= 90]
+            if not nxt:
+                ok = False
+                break
+            pos = nxt[0] + len(part)
+        if ok:
+            good.append(c)
+    if not good:
+        return None
+    if near is None:
+        return good[0]
+    return min(good, key=lambda c: abs(starts[c] - near))
+
+
+def closest(hay: list[str], needle: list[str], near: float | None, starts: list[float]) -> tuple[float, int]:
+    """Best fuzzy window (ratio, index) so a failing quote can be fixed, not just dropped."""
+    n = len(needle)
+    best = (0.0, 0)
+    sm = difflib.SequenceMatcher(autojunk=False)
+    sm.set_seq2(needle)
+    lo, hi = 0, len(hay) - n + 1
+    if near is not None:  # search a 10-minute window around the claimed time first
+        idx = [i for i, s in enumerate(starts) if abs(s - near) <= 300]
+        if idx:
+            lo, hi = idx[0], min(idx[-1] + 1, len(hay) - n + 1)
+    for i in range(lo, max(hi, lo + 1)):
+        window = hay[i:i + n]
+        if len(window) < n:
+            break
+        if len(set(window) & set(needle)) < n * 0.4:
+            continue
+        sm.set_seq1(window)
+        r = sm.ratio()
+        if r > best[0]:
+            best = (r, i)
+    return best
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("target", help="cliffnotes.md, or a transcript folder containing it")
+    ap.add_argument("--transcript", help="transcript folder (default: the file's folder)")
+    ap.add_argument("--tolerance", type=float, default=20, help="seconds a quote's timestamp may be off")
+    ap.add_argument("--max-words", type=int, default=1100, help="warn when the notes run longer")
+    a = ap.parse_args()
+
+    target = Path(a.target).expanduser()
+    notes_path = target / "cliffnotes.md" if target.is_dir() else target
+    if not notes_path.exists():
+        sys.exit(f"verify-quotes: {notes_path} not found")
+    folder = find_transcript_dir(a.transcript or notes_path.parent)
+    data = load_transcript(folder)
+    words = data["words"]
+    hay: list[str] = []; starts: list[float] = []; ends: list[float] = []
+    for w in words:
+        toks = norm_tokens(w["word"])
+        for t in toks:
+            hay.append(t); starts.append(w["start"]); ends.append(w["end"])
+    duration = float(data.get("source", {}).get("duration") or data.get("duration") or ends[-1])
+    source_url = (data.get("source") or {}).get("url") or data.get("url")
+    vid = youtube_id(source_url)
+
+    text = notes_path.read_text()
+    fails = warns = oks = 0
+
+    def out(kind: str, msg: str) -> None:
+        nonlocal fails, warns, oks
+        if kind == "FAIL": fails += 1
+        elif kind == "WARN": warns += 1
+        else: oks += 1
+        print(f"{kind}  {msg}")
+
+    for lineno, line in enumerate(text.splitlines(), 1):
+        if line.strip().startswith("```"):
+            continue
+        flat = ascii_punct(line)
+        stamps = [parse_hms(m) for m in STAMP_RE.findall(flat)]
+        tsecs = [int(m) for m in T_RE.findall(flat)]
+        for s in stamps:
+            if s > duration:
+                out("FAIL", f"line {lineno}: [{hms(s)}] is past the end of the video ({hms(duration)})")
+        for s in tsecs:
+            if s > duration:
+                out("FAIL", f"line {lineno}: t={s} is past the end of the video ({int(duration)} s)")
+        if stamps and tsecs and len(stamps) == len(tsecs):
+            for s, t in zip(stamps, tsecs):
+                if abs(s - t) > 1:
+                    out("FAIL", f"line {lineno}: [{hms(s)}] and t={t} disagree; [{hms(s)}] should link to t={int(s)}")
+        for v in YT_RE.findall(flat):
+            if vid and v != vid:
+                out("FAIL", f"line {lineno}: link points at video {v}, source is {vid}")
+        near = stamps[0] if stamps else (float(tsecs[0]) if tsecs else None)
+
+        for m in QUOTE_RE.finditer(flat):
+            raw = m.group(1)
+            parts = [norm_tokens(p) for p in re.split(r"\.\.\.|…", raw)]
+            parts = [p for p in parts if p]
+            if sum(len(p) for p in parts) < MIN_QUOTE_WORDS:
+                continue
+            idx = find_quote(hay, parts, near, starts)
+            if idx is None:
+                ratio, j = closest(hay, [t for p in parts for t in p], near, starts)
+                hint = " ".join(w["word"] for w in words[j:j + len(parts[0]) + 2]) if ratio > 0.5 else ""
+                hint = f' — closest ({int(ratio*100)}%) at [{hms(starts[j])}]: "{hint}"' if hint else " — nothing close; drop it"
+                out("FAIL", f"line {lineno}: not verbatim: \"{raw[:70]}{'…' if len(raw) > 70 else ''}\"{hint}")
+                continue
+            at = starts[idx]
+            if near is not None and abs(at - near) > a.tolerance:
+                out("FAIL", f"line {lineno}: quote is spoken at [{hms(at)}], not [{hms(near)}]: \"{raw[:50]}…\"")
+            else:
+                out("OK", f"line {lineno}: [{hms(at)}] \"{raw[:60]}{'…' if len(raw) > 60 else ''}\"")
+
+    n_words = len(re.findall(r"\b\w+\b", re.sub(r"\(https?://\S+\)", "", text)))
+    if n_words > a.max_words:
+        out("WARN", f"{n_words} words; a five-minute read is about {a.max_words} or fewer")
+    print(f"\n{oks} quotes verified, {fails} failed, {warns} warnings · {n_words} words · video {hms(duration)}")
+    sys.exit(1 if fails else 0)
+
+
+if __name__ == "__main__":
+    main()

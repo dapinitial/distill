@@ -1,0 +1,20 @@
+#!/usr/bin/env python3
+"""stamp: print a timestamp marker the way cliffnotes.md expects it.
+
+  stamp <transcript folder> <mm:ss | h:mm:ss | seconds> [more times...]
+
+YouTube sources get a link that jumps to that second; anything else gets a plain [mm:ss].
+"""
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from distill_common import find_transcript_dir, load_transcript, parse_hms, stamp  # noqa: E402
+
+if len(sys.argv) < 3:
+    sys.exit(__doc__)
+data = load_transcript(find_transcript_dir(sys.argv[1]))
+source = data.get("source") or {"url": data.get("url")}
+for t in sys.argv[2:]:
+    secs = parse_hms(t) if ":" in t else float(t)
+    print(stamp(secs, source))

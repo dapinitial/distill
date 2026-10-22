@@ -1,0 +1,500 @@
+#!/usr/bin/env python3
+"""transcribe: a media file or URL -> an LLM-ready transcript folder.
+
+  transcribe <file-or-url> [--out DIR] [--slug NAME] [--lang en] [--glossary FILE]
+                           [--threads N] [--force] [--section-target 180]
+
+Pipeline: yt-dlp (audio only, URLs) -> ffmpeg 16 kHz mono WAV -> whisper-cli (large-v3-turbo,
+full JSON) -> deterministic cleanup (whitespace, stutters, fillers, glossary) -> sentences ->
+sections at natural pauses -> transcript.md, transcript.json, chunks.jsonl, source.json.
+No speaker labels (v1). Nothing leaves this machine.
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from distill_common import hms, norm_token, slugify  # noqa: E402
+
+HERE = Path(__file__).resolve().parent
+HOME = Path(os.environ.get("DISTILL_HOME", HERE.parent))
+URL_RE = re.compile(r"^https?://", re.I)
+EOT = 50257  # whisper multilingual vocab: ids >= EOT are special/timestamp tokens
+FILLERS = {"um", "uh", "umm", "uhh", "erm", "uhm", "mm", "mhm"}
+STUTTER_OK = {"that", "had", "very", "no", "bye", "ha", "so", "really", "many", "is"}
+NONSPEECH_RE = re.compile(r"^\s*[\[\(\*].*[\]\)\*]\s*$")
+SUSPECT_GAP = 5.0   # seconds of silence isolating a first/last segment
+SUSPECT_P = 0.15    # token probability below which whisper is guessing
+LOW_P = 0.2         # words reported as low confidence
+
+
+def log(msg: str) -> None:
+    print(msg, file=sys.stderr, flush=True)
+
+
+def run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, check=True, text=True, **kw)
+
+
+class Timer:
+    def __init__(self) -> None:
+        self.t: dict[str, float] = {}
+        self._start = time.monotonic()
+
+    def step(self, name: str, fn):
+        t0 = time.monotonic()
+        out = fn()
+        self.t[name] = round(time.monotonic() - t0, 1)
+        log(f"  {name}: {self.t[name]}s")
+        return out
+
+    def total(self) -> float:
+        return round(time.monotonic() - self._start, 1)
+
+
+# ---------- 1. source ----------------------------------------------------------------------
+
+def probe_duration(path: Path) -> float:
+    out = run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "json", str(path)],
+              capture_output=True).stdout
+    return float(json.loads(out)["format"]["duration"])
+
+
+def resolve_source(inp: str, out_root: Path, slug_override: str | None, force: bool, timer: Timer):
+    """Return (source dict, media path, out dir)."""
+    if URL_RE.match(inp):
+        info = json.loads(timer.step("probe", lambda: run(
+            ["yt-dlp", "--no-playlist", "--no-warnings", "-J", inp], capture_output=True).stdout))
+        title = info.get("title") or "untitled"
+        slug = slug_override or slugify(title)
+        out_dir = out_root / slug
+        media_dir = out_dir / "media"
+        media_dir.mkdir(parents=True, exist_ok=True)
+        existing = [p for p in media_dir.glob("audio.*") if p.suffix != ".part"]
+        if existing and not force:
+            media = existing[0]
+            log(f"  download: skipped, have {media.name}")
+        else:
+            def dl():
+                run(["yt-dlp", "--no-playlist", "--no-warnings", "--quiet", "--no-progress", "-f", "bestaudio/best",
+                     "-o", str(media_dir / "audio.%(ext)s"), inp])
+                return [p for p in media_dir.glob("audio.*") if p.suffix != ".part"][0]
+            media = timer.step("download", dl)
+        source = {
+            "title": title,
+            "url": info.get("webpage_url") or inp,
+            "path": None,
+            "duration": float(info.get("duration") or probe_duration(media)),
+            "site": info.get("extractor_key"),
+            "id": info.get("id"),
+            "uploader": info.get("uploader") or info.get("channel"),
+            "upload_date": info.get("upload_date"),
+        }
+    else:
+        path = Path(inp).expanduser().resolve()
+        if not path.exists():
+            sys.exit(f"transcribe: no such file: {path}")
+        title = path.stem
+        slug = slug_override or slugify(title)
+        out_dir = out_root / slug
+        out_dir.mkdir(parents=True, exist_ok=True)
+        media = path
+        source = {"title": title, "url": None, "path": str(path), "duration": probe_duration(path),
+                  "site": None, "id": None, "uploader": None, "upload_date": None}
+    return source, media, out_dir
+
+
+# ---------- 2. audio + 3. whisper ----------------------------------------------------------
+
+def to_wav(media: Path, wav: Path, force: bool, timer: Timer) -> None:
+    if wav.exists() and not force:
+        log("  ffmpeg: skipped, have audio.wav")
+        return
+    timer.step("ffmpeg", lambda: run(
+        ["ffmpeg", "-y", "-loglevel", "error", "-i", str(media), "-vn", "-ac", "1", "-ar", "16000",
+         "-c:a", "pcm_s16le", str(wav)]))
+
+
+def whisper(wav: Path, prefix: Path, model: Path, lang: str, threads: int, force: bool, timer: Timer) -> dict:
+    out = prefix.with_suffix(".json")
+    if out.exists() and not force:
+        log("  whisper: skipped, have whisper.json (use --force to redo)")
+    else:
+        if not model.exists():
+            sys.exit(f"transcribe: model not found at {model} (run bin/setup)")
+        cmd = ["whisper-cli", "-m", str(model), "-f", str(wav), "-l", lang, "-t", str(threads),
+               "-oj", "-ojf", "-of", str(prefix), "-np", "-pp"]
+        timer.step("whisper", lambda: run(cmd, stdout=subprocess.DEVNULL,
+                                           stderr=open(prefix.with_suffix(".log"), "w")))
+    return json.loads(out.read_text())
+
+
+# ---------- 4. tokens -> words -------------------------------------------------------------
+
+def words_from_whisper(data: dict) -> tuple[list[dict], list[dict]]:
+    """Merge whisper tokens into words. Returns (words, dropped_suspect_segments)."""
+    segs: list[list[dict]] = []
+    for seg in data["transcription"]:
+        if NONSPEECH_RE.match(seg["text"]) or not seg["text"].strip():
+            continue
+        words: list[dict] = []
+        cur: dict | None = None
+        for tok in seg["tokens"]:
+            text = tok["text"]
+            if tok["id"] >= EOT or text.startswith("[_") or not text.strip():
+                continue
+            t0, t1 = tok["offsets"]["from"] / 1000, tok["offsets"]["to"] / 1000
+            if text.startswith(" ") or cur is None:
+                cur = {"word": text.strip(), "start": t0, "end": t1, "p": tok["p"]}
+                words.append(cur)
+            else:  # continuation of a word, or punctuation glued to it
+                cur["word"] += text
+                cur["end"] = max(cur["end"], t1)
+                cur["p"] = min(cur["p"], tok["p"])
+        if words:
+            segs.append(words)
+
+    # Whisper hallucinates on silence: subtitle credits before the talk starts, "Thanks for
+    # watching" after it ends. Drop a first/last segment that is isolated by >= 5 s of silence
+    # and contains a word the model itself barely believed (p < 0.15). Keep a record.
+    dropped: list[dict] = []
+    def suspect(seg, neighbour, lead):
+        gap = (neighbour[0]["start"] - seg[-1]["end"]) if lead else (seg[0]["start"] - neighbour[-1]["end"])
+        return gap >= SUSPECT_GAP and min(w["p"] for w in seg) < SUSPECT_P
+    while len(segs) > 1 and suspect(segs[0], segs[1], True):
+        dropped.append(segs.pop(0))
+    while len(segs) > 1 and suspect(segs[-1], segs[-2], False):
+        dropped.append(segs.pop())
+
+    words = [w for seg in segs for w in seg]
+    for i, w in enumerate(words):  # keep times monotonic and sane
+        if i and w["start"] < words[i - 1]["start"]:
+            w["start"] = words[i - 1]["start"]
+        if w["end"] < w["start"]:
+            w["end"] = w["start"]
+    dropped_info = [{"start": round(d[0]["start"], 2), "end": round(d[-1]["end"], 2),
+                     "text": " ".join(w["word"] for w in d), "min_p": round(min(w["p"] for w in d), 3)}
+                    for d in dropped]
+    return drop_inline_nonspeech(words), dropped_info
+
+
+def drop_inline_nonspeech(words: list[dict]) -> list[dict]:
+    """Remove '(laughs)', '[Music]', '♪' when they appear inside a segment (span of <= 4 words)."""
+    out, i = [], 0
+    while i < len(words):
+        w = words[i]["word"]
+        if w and w[0] in "([" :
+            for j in range(i, min(i + 4, len(words))):
+                if words[j]["word"].rstrip(".,!?").endswith((")", "]")):
+                    i = j + 1
+                    break
+            else:
+                out.append(words[i]); i += 1
+            continue
+        if w.strip("♪♫ ") == "":
+            i += 1; continue
+        out.append(words[i]); i += 1
+    return out
+
+
+# ---------- 5. deterministic cleanup -------------------------------------------------------
+
+TERMINAL = ".?!"
+
+
+def _move_trailing_punct(src: dict, dst: dict | None) -> None:
+    m = re.search(r"[.,!?;:]+$", src["word"])
+    if m and dst is not None and not re.search(r"[.,!?;:]$", dst["word"]):
+        dst["word"] += m.group(0)
+
+
+def remove_fillers(words: list[dict]) -> tuple[list[dict], int]:
+    out: list[dict] = []
+    removed = 0
+    for w in words:
+        if norm_token(w["word"]) in FILLERS:
+            _move_trailing_punct(w, out[-1] if out else None)
+            removed += 1
+            continue
+        out.append(w)
+    return out, removed
+
+
+def remove_stutters(words: list[dict], max_n: int = 3) -> tuple[list[dict], int]:
+    """'I I I think' -> 'I think'; 'you know you know' -> 'you know'. Keeps the last copy."""
+    removed = 0
+    i = 0
+    out = list(words)
+    while i < len(out):
+        hit = False
+        for n in range(max_n, 0, -1):
+            if i + 2 * n > len(out):
+                continue
+            a = [norm_token(x["word"]) for x in out[i:i + n]]
+            b = [norm_token(x["word"]) for x in out[i + n:i + 2 * n]]
+            if a != b or not all(a):
+                continue
+            if n == 1 and a[0] in STUTTER_OK:
+                continue
+            if any(re.search(r"[.?!]$", x["word"]) for x in out[i:i + n]):
+                continue  # 'No. No.' is emphasis, not a stutter
+            out[i + n]["start"] = out[i]["start"]
+            del out[i:i + n]
+            removed += n
+            hit = True
+            break
+        if not hit:
+            i += 1
+    return out, removed
+
+
+def load_glossary(paths: list[Path]) -> list[tuple[list[str], str]]:
+    rules: dict[tuple[str, ...], str] = {}
+    for p in paths:
+        for raw in p.read_text().splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            if m := re.match(r"^(.+?)\s*(?:→|->|=>)\s*(.+)$", line):
+                wrong, right = m.group(1).strip(), m.group(2).strip()
+            else:
+                wrong = right = line
+            key = tuple(norm_token(t) for t in wrong.split())
+            if all(key):
+                rules[key] = right
+    return sorted(rules.items(), key=lambda kv: -len(kv[0]))  # longest phrase first
+
+
+def apply_glossary(words: list[dict], rules: list[tuple[tuple[str, ...], str]]) -> tuple[list[dict], int]:
+    if not rules:
+        return words, 0
+    by_len: dict[int, dict[tuple[str, ...], str]] = {}
+    for key, right in rules:
+        by_len.setdefault(len(key), {})[key] = right
+    lens = sorted(by_len, reverse=True)
+    norms = [norm_token(w["word"]) for w in words]
+    out: list[dict] = []
+    i = 0
+    changed = 0
+    while i < len(words):
+        matched = False
+        for n in lens:
+            key = tuple(norms[i:i + n])
+            right = by_len[n].get(key)
+            if right is None:
+                continue
+            span = words[i:i + n]
+            lead = re.match(r"^[^\w$]*", span[0]["word"]).group(0)
+            trail = re.search(r"[^\w%]*$", span[-1]["word"]).group(0)
+            parts = right.split()
+            produced = [(lead if k == 0 else "") + p + (trail if k == len(parts) - 1 else "") for k, p in enumerate(parts)]
+            if produced != [w["word"] for w in span]:
+                changed += 1
+            s, e = span[0]["start"], span[-1]["end"]
+            step = (e - s) / len(parts) if parts else 0
+            for k, text in enumerate(produced):
+                out.append({"word": text,
+                            "start": round(s + k * step, 3), "end": round(s + (k + 1) * step, 3),
+                            "p": min(w["p"] for w in span)})
+            i += n
+            matched = True
+            break
+        if not matched:
+            out.append(words[i]); i += 1
+    return out, changed
+
+
+def tidy(words: list[dict]) -> list[dict]:
+    """Whitespace and stray punctuation: no empty words, no doubled spaces, no lone commas."""
+    out: list[dict] = []
+    for w in words:
+        text = re.sub(r"\s+", " ", w["word"]).strip()
+        if not text:
+            continue
+        if re.fullmatch(r"[.,!?;:]+", text) and out:  # whisper sometimes emits ' .' as its own token
+            out[-1]["word"] += text
+            out[-1]["end"] = max(out[-1]["end"], w["end"])
+            continue
+        w = dict(w, word=text)
+        out.append(w)
+    return out
+
+
+# ---------- 6. sentences, 7. sections -----------------------------------------------------
+
+SENT_END = re.compile(r"[.?!][\"')\]]*$")
+
+
+def sentences(words: list[dict], max_gap: float = 2.0, max_len: float = 45.0) -> list[dict]:
+    sents: list[dict] = []
+    cur: list[dict] = []
+    for idx, w in enumerate(words):
+        cur.append(w)
+        nxt = words[idx + 1] if idx + 1 < len(words) else None
+        ends = SENT_END.search(w["word"]) is not None
+        gap = (nxt["start"] - w["end"]) if nxt else 0
+        too_long = (w["end"] - cur[0]["start"]) > max_len and gap > 0.6
+        if ends or gap > max_gap or too_long or nxt is None:
+            sents.append({"start": cur[0]["start"], "end": cur[-1]["end"],
+                          "text": " ".join(x["word"] for x in cur), "n": len(cur),
+                          "gap_after": gap if nxt else 0.0})
+            cur = []
+    return sents
+
+
+def sections(sents: list[dict], target: float, lo: float, hi: float) -> list[list[dict]]:
+    """Greedy: after `lo` seconds, cut at the sentence boundary with the longest pause,
+    nudged toward `target`; never later than `hi`."""
+    out: list[list[dict]] = []
+    i = 0
+    while i < len(sents):
+        start = sents[i]["start"]
+        best, best_score = None, None
+        j = i
+        while j < len(sents):
+            dur = sents[j]["end"] - start
+            if dur >= lo:
+                score = sents[j]["gap_after"] - abs(dur - target) / 120.0
+                if best_score is None or score > best_score:
+                    best, best_score = j, score
+            if dur >= hi:
+                break
+            j += 1
+        cut = best if best is not None else min(j, len(sents) - 1)
+        out.append(sents[i:cut + 1])
+        i = cut + 1
+    # don't leave a stub at the end
+    if len(out) > 1 and out[-1][-1]["end"] - out[-1][0]["start"] < lo / 2:
+        out[-2].extend(out.pop())
+    return out
+
+
+def paragraphs(sents: list[dict], min_len: float = 20.0, max_len: float = 75.0, gap: float = 1.2) -> list[list[dict]]:
+    paras: list[list[dict]] = []
+    cur: list[dict] = []
+    for s in sents:
+        cur.append(s)
+        dur = cur[-1]["end"] - cur[0]["start"]
+        if (dur >= min_len and s["gap_after"] >= gap) or dur >= max_len:
+            paras.append(cur); cur = []
+    if cur:
+        paras.append(cur)
+    return paras
+
+
+# ---------- 8. write -----------------------------------------------------------------------
+
+def write_outputs(out_dir: Path, source: dict, words: list[dict], secs: list[list[dict]]) -> None:
+    hours = source["duration"] >= 3600
+    sec_records = []
+    for k, sec in enumerate(secs, 1):
+        sec_records.append({
+            "index": k, "start": round(sec[0]["start"], 2), "end": round(sec[-1]["end"], 2),
+            "start_hms": hms(sec[0]["start"], hours), "end_hms": hms(sec[-1]["end"], hours),
+            "text": " ".join(s["text"] for s in sec), "word_count": sum(s["n"] for s in sec),
+        })
+
+    with (out_dir / "chunks.jsonl").open("w") as f:
+        for r in sec_records:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+    (out_dir / "transcript.json").write_text(json.dumps({
+        "title": source["title"], "url": source["url"], "duration": source["duration"],
+        "words": [{"word": w["word"], "start": round(w["start"], 2), "end": round(w["end"], 2)} for w in words],
+        "sections": [{k: v for k, v in r.items() if k != "text"} for r in sec_records],
+    }, ensure_ascii=False))
+
+    lines = [f"# {source['title']}", ""]
+    meta = [f"Duration {hms(source['duration'], hours)}", f"Model {source['model']}", "No speaker labels (v1)"]
+    if source["url"]:
+        lines.append(f"Source: {source['url']}  ")
+    lines += [" · ".join(meta), ""]
+    for r, sec in zip(sec_records, secs):
+        lines += [f"## {r['index']}. [{r['start_hms']}–{r['end_hms']}]", ""]
+        for para in paragraphs(sec):
+            lines += [f"[{hms(para[0]['start'], hours)}] " + " ".join(s["text"] for s in para), ""]
+    (out_dir / "transcript.md").write_text("\n".join(lines).rstrip() + "\n")
+    (out_dir / "source.json").write_text(json.dumps(source, indent=2, ensure_ascii=False) + "\n")
+
+
+# ---------- main ---------------------------------------------------------------------------
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("input", help="media file or URL")
+    ap.add_argument("--out", default=os.environ.get("DISTILL_OUT", str(HOME / "out")), help="output root")
+    ap.add_argument("--slug", help="folder name under --out (default: from the title)")
+    ap.add_argument("--lang", default="en", help="language code, or 'auto'")
+    ap.add_argument("--model", default=os.environ.get("DISTILL_MODEL", str(HOME / "models/ggml-large-v3-turbo.bin")))
+    ap.add_argument("--glossary", action="append", default=[], help="extra glossary file (repeatable)")
+    ap.add_argument("--threads", type=int, default=min(8, os.cpu_count() or 4))
+    ap.add_argument("--section-target", type=float, default=180, help="ideal section length, seconds")
+    ap.add_argument("--section-min", type=float, default=90)
+    ap.add_argument("--section-max", type=float, default=300)
+    ap.add_argument("--force", action="store_true", help="redo download, wav and whisper even if cached")
+    ap.add_argument("--quiet", action="store_true")
+    a = ap.parse_args()
+    if a.quiet:
+        global log
+        log = lambda msg: None  # noqa: E731
+
+    for tool in ("ffmpeg", "ffprobe", "whisper-cli") + (("yt-dlp",) if URL_RE.match(a.input) else ()):
+        if not shutil.which(tool):
+            sys.exit(f"transcribe: {tool} not on PATH (run bin/setup)")
+
+    timer = Timer()
+    log(f"transcribe: {a.input}")
+    source, media, out_dir = resolve_source(a.input, Path(a.out).expanduser(), a.slug, a.force, timer)
+    log(f"  → {out_dir}")
+    wav = out_dir / "audio.wav"
+    to_wav(media, wav, a.force, timer)
+    model = Path(a.model).expanduser()
+    raw = whisper(wav, out_dir / "whisper", model, a.lang, a.threads, a.force, timer)
+
+    def post():
+        words, dropped = words_from_whisper(raw)
+        words = tidy(words)
+        n_raw = len(words)
+        words, n_fill = remove_fillers(words)
+        words, n_stut = remove_stutters(words)
+        gl_paths = [Path(p) for p in a.glossary] + [Path.cwd() / "glossary.txt", HOME / "glossary.txt"]
+        gl_paths = list(dict.fromkeys(p.resolve() for p in gl_paths if p.exists()))
+        words, n_gl = apply_glossary(words, load_glossary(gl_paths))
+        words = tidy(words)
+        sents = sentences(words)
+        secs = sections(sents, a.section_target, a.section_min, a.section_max)
+        low = [{"word": w["word"], "at": hms(w["start"], source["duration"] >= 3600), "p": round(w["p"], 2)}
+               for w in words if w["p"] < LOW_P]
+        return words, secs, {"words_raw": n_raw, "fillers_removed": n_fill, "stutter_words_removed": n_stut,
+                             "glossary_replacements": n_gl, "glossary_files": [str(p) for p in gl_paths],
+                             "dropped_suspect_segments": dropped,
+                             "low_confidence_words": low[:100], "low_confidence_count": len(low)}
+
+    words, secs, cleanup = timer.step("cleanup+sections", post)
+    source.update({
+        "model": model.stem.replace("ggml-", ""), "language": a.lang, "speaker_labels": False,
+        "created_at": dt.datetime.now().astimezone().isoformat(timespec="seconds"),
+        "word_count": len(words), "section_count": len(secs), "cleanup": cleanup,
+        "timings_seconds": {**timer.t, "total": timer.total()},
+    })
+    write_outputs(out_dir, source, words, secs)
+    for d in cleanup["dropped_suspect_segments"]:
+        log(f"  dropped suspect segment at {hms(d['start'])}: \"{d['text']}\" (p={d['min_p']})")
+    if cleanup["low_confidence_count"]:
+        sample = ", ".join(f"{w['word']}@{w['at']}" for w in cleanup["low_confidence_words"][:8])
+        log(f"  low-confidence words: {cleanup['low_confidence_count']} (see source.json), e.g. {sample}")
+    log(f"  done in {timer.total()}s: {len(words)} words, {len(secs)} sections, {hms(source['duration'])} of audio")
+    print(out_dir)
+
+
+if __name__ == "__main__":
+    main()

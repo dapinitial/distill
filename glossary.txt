@@ -1,0 +1,26 @@
+# distill glossary. One preferred spelling per line; Whisper's guesses are matched
+# case-insensitively and rewritten to this exact form. Multi-word terms are fine.
+# Use "wrong → right" (or "wrong -> right") when Whisper hears a different word.
+# Lines starting with # are comments. transcribe merges this file with ./glossary.txt
+# in the current project, so keep names and jargon for a project next to that project.
+whisper.cpp
+yt-dlp
+ffmpeg
+Claude Code
+ChatGPT
+OpenAI
+Anthropic
+GPU
+LLM
+LLMs
+YouTube
+Llama 2
+Llama 3
+GPT-4
+JavaScript
+TypeScript
+Python
+chat GPT → ChatGPT
+Lama 2 → Llama 2
+Lama 3 → Llama 3
+open AI → OpenAI
