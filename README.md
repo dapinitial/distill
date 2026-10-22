@@ -35,9 +35,26 @@ Symlinks, not copies, so editing `skills/*/SKILL.md` here updates them everywher
 ```bash
 transcribe "https://www.youtube.com/watch?v=..."     # or a local .mp4/.m4a/.wav
 transcribe talk.mp4 --glossary names.txt --slug talk
+transcribe "<playlist or channel url>" --playlist    # every entry, one folder each
+transcribe "<url>" --video                           # keep 720p video so the page gets frame grabs
+glossary-suggest out/<slug>                          # names Whisper likely misheard, as glossary lines
+render out/<slug> --open                             # the page, with an embedded player
+library --open                                       # index of everything under out/
+where --all "phrase"                                 # which talks said it, and when
 ```
 
 Or in Claude Code: `/transcribe <link>` then `/cliffnotes <folder>`, or just `/cliffnotes <link>`.
+
+### Unattended
+
+Put links in `queue.txt` (one per line, playlists allowed) and run `distill-batch`. It transcribes
+each item, runs the cliffnotes skill headlessly in Claude Code (`claude -p`), checks the result with
+`verify-quotes`, refreshes the library and moves finished lines to `queue.done.txt`. Add `--publish`
+to also publish each page as an Artifact. Schedule it with cron, launchd, or a Claude Code routine:
+
+```
+0 6 * * *  cd ~/Sites/distill && direnv exec . bin/distill-batch >> out/cron.log 2>&1
+```
 
 Each transcript folder holds:
 
@@ -60,7 +77,17 @@ Each transcript folder holds:
 | `verify-quotes` | proves every quoted span in `cliffnotes.md` is verbatim and every timestamp is inside the video; exit 1 on any failure, with a hint on how to fix each |
 | `where` | find when a phrase was said, printed as a timestamp link |
 | `stamp` | turn `7:49` or `469` into the `[07:49](…&t=469)` marker |
-| `render` | one self-contained HTML page per transcript: notes beside the transcript, search, timestamp links. `--open` adds an embedded player (YouTube or the local audio) that seeks from any timestamp and highlights the paragraph being spoken |
+| `render` | one self-contained HTML page per transcript: notes beside the transcript, search, timestamp links, frame grabs when the video is present. `--open` adds an embedded player (YouTube or the local audio) that seeks from any timestamp and highlights the paragraph being spoken |
+| `library` | `out/index.md` and `out/index.html`: every transcript with its date, length, the point, and links |
+| `glossary-suggest` | three deterministic signals for misheard names: spelling clusters, disagreements with YouTube's captions, low-confidence words |
+| `distill-batch` | queue runner for unattended transcribe → cliffnotes → verify → library |
+| `test` | regression checks for the cleanup rules, sectioning and verify-quotes |
+
+## Sections
+
+When the creator published chapter marks, those become the sections (snapped to sentence ends,
+tiny chapters merged, huge ones split at pauses) and each section carries its chapter title.
+Otherwise sections are cut at the longest pause between 90 seconds and 5 minutes, aiming for 3.
 
 ## Cleanup is code, not a model
 

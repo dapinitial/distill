@@ -14,7 +14,9 @@ An hour of video becomes a five-minute read, and nothing in quotation marks is i
   the folder). Pass along `--glossary` or `--slug` if the user gave names or a folder name.
 
 Read `source.json` (title, url, duration, `low_confidence_words`, `dropped_suspect_segments`)
-and `chunks.jsonl` (one section per line, each a few minutes with `start_hms`/`end_hms`).
+and `chunks.jsonl` (one section per line, each a few minutes with `start_hms`/`end_hms`, and a
+`title` when the creator published chapter marks; use those titles, they are the speaker's own
+structure).
 `transcript.md` is the same text with `[mm:ss]` markers every paragraph; use it when you need a
 time for a specific line.
 
@@ -89,6 +91,39 @@ Rules:
 - No speaker labels exist in v1; if two people talk, say "the host" / "the guest" from context
   and note that attribution is inferred.
 
+## 3b. Meeting mode
+
+For a recording of a meeting, call, interview or voice memo (a local file, or the user says it is
+a meeting), write `meeting.md` instead of `cliffnotes.md`, same verification rules:
+
+```markdown
+# <Title or "Meeting, <date>">
+<source · duration · N-minute read>
+
+## In one paragraph
+What the meeting was for and what came out of it.
+
+## Decisions
+- [mm:ss] Decision as stated. Who stated it if the transcript makes that clear.
+
+## Action items
+- [mm:ss] Owner (or "unassigned") — what — by when (only if a date was said)
+
+## Open questions
+- [mm:ss] Question that was raised and not settled.
+
+## Timeline
+- [mm:ss] Topic, one line each, in order.
+
+## Exact quotes
+> "verbatim" — [mm:ss]
+```
+
+Attribution: without speaker labels, name people only when the transcript names them ("as Sam
+said"); otherwise say "one participant". When `transcript.md` has `**Speaker 1:**` labels (the
+`--speakers` option of transcribe), use them and say in the header that speakers were detected
+automatically and numbered, not named, unless the user supplies names.
+
 ## 4. Verify, fix, repeat
 
 ```bash
@@ -120,6 +155,10 @@ comment on the artifact and the publishing session sees it, so a viewer can ask 
 from the page itself. Report the artifact link with the notes.
 
 ## 6. Show the notes
+
+Unattended runs: `distill-batch` calls this skill headlessly for each queued item and checks the
+result with `verify-quotes`, so the rules above are the contract. Do the verification yourself
+too; a run that skips it fails the batch.
 
 Print `cliffnotes.md` in full in your reply (it is short by design), with the folder path and
 the step timings from `source.json → timings_seconds` if you ran transcribe.

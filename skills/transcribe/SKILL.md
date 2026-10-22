@@ -18,6 +18,9 @@ transcribe <url> --slug my-name          # choose the folder name
 transcribe <file> --lang auto            # default is English
 transcribe <file> --glossary names.txt   # extra glossary for this run (repeatable)
 transcribe <url> --force                 # redo download, audio and Whisper (otherwise cached)
+transcribe <playlist-url> --playlist     # every entry becomes its own folder
+transcribe <url> --video                 # also keep 720p video so render can grab frames
+transcribe <file> --no-chapters          # ignore chapter marks, cut at pauses only
 ```
 
 `transcribe` lives in this repo's `bin/`. From another project it is on PATH only if direnv has
@@ -49,8 +52,11 @@ and rerunning is cheap.
      One preferred spelling per line (`ChatGPT`, `whisper.cpp`, `Claude Code`), or
      `wrong → right` for words Whisper mishears (`chat GPT → ChatGPT`). Matching is
      case-insensitive and can span several words.
-5. **Sentences and sections**: sentences end at `.?!` or a pause over 2 s. Sections are cut only
-   at sentence ends, at the longest pause between 90 s and 5 min, aiming for about 3 min.
+5. **Sentences and sections**: sentences end at `.?!` or a pause over 2 s. When the source has
+   chapter marks (YouTube chapters), sections follow them, snapped to sentence ends, with the
+   chapter title on each section. Otherwise sections are cut at the longest pause between 90 s
+   and 5 min, aiming for about 3 min. YouTube's own captions are saved in `media/` as a second
+   opinion for `glossary-suggest`.
 6. **Write** the folder:
 
 | file | what |
@@ -69,9 +75,11 @@ After it finishes, tell the user:
   (`source.json → timings_seconds`);
 - anything dropped as a suspected hallucination, and the count of low-confidence words
   (`cleanup.low_confidence_words`, with times) so they can spot-check;
-- names or terms that look misspelled in `transcript.md`. Suggest glossary lines for them and,
-  if the user agrees, add them and rerun (seconds, since Whisper is cached). Never edit the
-  transcript files by hand.
+- names or terms that look misspelled. Run `glossary-suggest <folder>`: it prints candidate
+  `wrong → right` lines from spelling clusters, caption disagreements and low-confidence words.
+  Read them critically (captions are noisy), add the ones that are right to `glossary.txt` (the
+  repo one for general terms, a `glossary.txt` in the user's project for its own names), and
+  rerun transcribe (seconds, since Whisper is cached). Never edit the transcript files by hand.
 
 ## Limits (v1)
 
