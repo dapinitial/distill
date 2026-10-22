@@ -25,7 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from distill_common import ascii_punct, find_transcript_dir, hms, load_transcript, norm_tokens, parse_hms, youtube_id  # noqa: E402
 
 QUOTE_RE = re.compile(r'"([^"\n]{8,}?)"')
-STAMP_RE = re.compile(r"\[(\d{1,2}:\d{2}(?::\d{2})?)\]")
+STAMP_RE = re.compile(r"\[(\d{1,2}:\d{2}(?::\d{2})?)(?:\s*[-\u2013]\s*(\d{1,2}:\d{2}(?::\d{2})?))?\]")
 T_RE = re.compile(r"[?&]t=(\d+)s?\b")
 YT_RE = re.compile(r"youtu(?:\.be/|be\.com/(?:watch\?v=|shorts/|embed/))([A-Za-z0-9_-]{11})")
 MIN_QUOTE_WORDS = 4
@@ -37,7 +37,7 @@ def find_all(hay: list[str], needle: list[str]) -> list[int]:
     return [i for i in range(len(hay) - n + 1) if hay[i] == first and hay[i:i + n] == needle]
 
 
-def find_quote(hay: list[str], parts: list[list[str]], near: float | None, starts: list[float]) -> int | None:
+def find_quote(hay: list[str], parts: list[list[str]], anchors: list[float], starts: list[float]) -> int | None:
     """Return the index of the first word of the match, honouring '...' elisions (parts in order,
     each within 90 s of the previous). Picks the occurrence nearest `near` seconds."""
     cands = find_all(hay, parts[0])
@@ -57,9 +57,9 @@ def find_quote(hay: list[str], parts: list[list[str]], near: float | None, start
             good.append(c)
     if not good:
         return None
-    if near is None:
+    if not anchors:
         return good[0]
-    return min(good, key=lambda c: abs(starts[c] - near))
+    return min(good, key=lambda c: min(abs(starts[c] - t) for t in anchors))
 
 
 def closest(hay: list[str], needle: list[str], near: float | None, starts: list[float]) -> tuple[float, int]:
@@ -123,8 +123,10 @@ def main() -> None:
     for lineno, line in enumerate(text.splitlines(), 1):
         if line.strip().startswith("```"):
             continue
-        flat = ascii_punct(line)
-        stamps = [parse_hms(m) for m in STAMP_RE.findall(flat)]
+        flat = line  # keep en dashes so ranges parse; quotes are straightened per match below
+        pairs = [(parse_hms(a), parse_hms(b) if b else None) for a, b in STAMP_RE.findall(flat)]
+        stamps = [a for a, _ in pairs] + [b for _, b in pairs if b is not None]
+        ranges = [(a, b) for a, b in pairs if b is not None]
         tsecs = [int(m) for m in T_RE.findall(flat)]
         for s in stamps:
             if s > duration:
@@ -132,22 +134,30 @@ def main() -> None:
         for s in tsecs:
             if s > duration:
                 out("FAIL", f"line {lineno}: t={s} is past the end of the video ({int(duration)} s)")
-        if stamps and tsecs and len(stamps) == len(tsecs):
-            for s, t in zip(stamps, tsecs):
+        plain = [a for a, b in pairs if b is None] + [lo for lo, _ in ranges]
+        if plain and tsecs and len(plain) == len(tsecs):
+            for s, t in zip(plain, tsecs):
                 if abs(s - t) > 1:
                     out("FAIL", f"line {lineno}: [{hms(s)}] and t={t} disagree; [{hms(s)}] should link to t={int(s)}")
         for v in YT_RE.findall(flat):
             if vid and v != vid:
                 out("FAIL", f"line {lineno}: link points at video {v}, source is {vid}")
-        near = stamps[0] if stamps else (float(tsecs[0]) if tsecs else None)
+        anchors = stamps or [float(t) for t in tsecs]
+        near = anchors[0] if anchors else None
 
-        for m in QUOTE_RE.finditer(flat):
+        def placed(at: float) -> bool:
+            """A quote is well placed if it sits inside a range on the line or within tolerance of any stamp."""
+            if any(lo - a.tolerance <= at <= hi + a.tolerance for lo, hi in ranges):
+                return True
+            return any(abs(at - s) <= a.tolerance for s in anchors)
+
+        for m in QUOTE_RE.finditer(ascii_punct(flat)):
             raw = m.group(1)
             parts = [norm_tokens(p) for p in re.split(r"\.\.\.|…", raw)]
             parts = [p for p in parts if p]
             if sum(len(p) for p in parts) < MIN_QUOTE_WORDS:
                 continue
-            idx = find_quote(hay, parts, near, starts)
+            idx = find_quote(hay, parts, anchors, starts)
             if idx is None:
                 ratio, j = closest(hay, [t for p in parts for t in p], near, starts)
                 hint = " ".join(w["word"] for w in words[j:j + len(parts[0]) + 2]) if ratio > 0.5 else ""
@@ -155,7 +165,7 @@ def main() -> None:
                 out("FAIL", f"line {lineno}: not verbatim: \"{raw[:70]}{'…' if len(raw) > 70 else ''}\"{hint}")
                 continue
             at = starts[idx]
-            if near is not None and abs(at - near) > a.tolerance:
+            if anchors and not placed(at):
                 out("FAIL", f"line {lineno}: quote is spoken at [{hms(at)}], not [{hms(near)}]: \"{raw[:50]}…\"")
             else:
                 out("OK", f"line {lineno}: [{hms(at)}] \"{raw[:60]}{'…' if len(raw) > 60 else ''}\"")

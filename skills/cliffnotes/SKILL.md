@@ -1,0 +1,108 @@
+---
+name: cliffnotes
+description: Turn a long video, podcast or talk into a five-minute read — the point, the argument with timestamped links, verbatim quotes verified against the transcript, decisions and numbers, and what's worth watching vs. safe to skip. Takes a transcript folder from /transcribe, or a file or link (it transcribes first). Use when the user says "cliff notes", "summarize this video", "TL;DW", "what's the gist of this talk", "do I need to watch this".
+---
+
+# /cliffnotes — transcript (or file or link) → cliffnotes.md
+
+An hour of video becomes a five-minute read, and nothing in quotation marks is invented.
+
+## 1. Get a transcript folder
+
+- Input is a folder containing `transcript.json` → use it.
+- Input is a file or URL → run `transcribe <input>` first (see the transcribe skill; it prints
+  the folder). Pass along `--glossary` or `--slug` if the user gave names or a folder name.
+
+Read `source.json` (title, url, duration, `low_confidence_words`, `dropped_suspect_segments`)
+and `chunks.jsonl` (one section per line, each a few minutes with `start_hms`/`end_hms`).
+`transcript.md` is the same text with `[mm:ss]` markers every paragraph; use it when you need a
+time for a specific line.
+
+## 2. Long transcripts: section by section first
+
+If the video is over about 25 minutes or the transcript over about 6,000 words, do not try to
+write the notes in one pass. First write `sections.md` in the transcript folder, one block per
+chunk, in this shape (this is Contextual Retrieval applied to a transcript: the one-line header
+situates each section in the whole):
+
+```
+## 3. [07:49–11:02] — About: the six vocal warm-ups he does before every talk
+- [07:49] asks the audience to stand; frames warm-ups as owed to yourself before anything important
+- [08:40] exercise list: arms up + sigh, lips "bop", "brrr", tongue "la", rolled R, the siren
+- Quote candidates (copied exactly from the chunk text):
+  - [08:46] "if I can only do one, the pros call this the siren"
+- Numbers/decisions/to-dos: six exercises; do them before every talk
+```
+
+Work through every chunk in order (read the chunk text, write its block, move on). Then write
+the cliff notes from `sections.md`, going back to `chunks.jsonl` only to copy quotes exactly.
+For short videos, read all chunks and go straight to step 3.
+
+## 3. Write `cliffnotes.md` in the transcript folder
+
+Target 600–900 words, never more than 1,100 (`verify-quotes` warns). Format:
+
+```markdown
+# <Title>
+
+<Source line: speaker/channel if known · duration · YouTube link or file path> · <N>-minute read
+
+## The point
+Three sentences. What is being argued or shown, why it matters, what the speaker wants you to do or believe.
+
+## The meat
+The argument as an outline, in the order it is made. Every item starts with a timestamp.
+- [02:17](https://www.youtube.com/watch?v=ID&t=137) Claim or step, in your words.
+  - sub-points only when the structure needs them
+
+## Exact quotes
+The 3–6 lines worth repeating, each a blockquote, each verbatim:
+> "quote exactly as transcribed" — [05:05](...&t=305)
+
+## Decisions, numbers, to-dos
+- Only things said out loud: figures, dates, commitments, recommendations, "go do X". With timestamps.
+- Write "None stated." if there are none. Do not infer.
+
+## Worth watching
+- [07:49–09:05](...&t=469) Why seeing this beats reading it (demo, live exercise, chart, tone that text loses).
+(2–3 stretches)
+
+## Safe to skip
+- [00:00–00:14] intro / housekeeping / sponsor read / repeated recap, with a reason.
+
+---
+Transcribed locally (whisper.cpp large-v3-turbo, no speaker labels). Quotes verified word for word with verify-quotes.
+```
+
+Rules:
+- **Timestamps** come from the chunk/paragraph markers or from `transcript.json` word times.
+  For YouTube sources every timestamp is a link that jumps to that second:
+  `[mm:ss](https://www.youtube.com/watch?v=<id>&t=<seconds>)`. Use `stamp <folder> 7:49`
+  to print the marker rather than doing the arithmetic in your head. Non-YouTube sources get
+  plain `[mm:ss]`.
+- **Quotation marks mean verbatim.** Copy from the transcript text; never tidy, never
+  paraphrase, never merge two sentences into one quote. Elide with `...` if you must skip words.
+  Anything you reword goes outside quotes. This holds in every section, not only Exact quotes.
+- Prefer the speaker's structure over yours. Keep the order they made the argument in.
+- Treat `low_confidence_words` and anything in the first/last 20 seconds with suspicion;
+  don't build a quote on them.
+- No speaker labels exist in v1; if two people talk, say "the host" / "the guest" from context
+  and note that attribution is inferred.
+
+## 4. Verify, fix, repeat
+
+```bash
+verify-quotes <folder>/cliffnotes.md
+```
+
+It checks every double-quoted span of 4+ words against the transcript, every `[mm:ss]` and
+`&t=` against the video length, that a quote's timestamp is within 20 s of where it was said,
+that `[mm:ss]` and `t=` on the same line agree, and that links point at the right video.
+For each FAIL it prints what to do (the real time, or the closest wording it found). Fix the
+line or drop it, rerun, and only report the notes when it exits 0. Paste the final summary line
+(`N quotes verified, 0 failed`) in your reply.
+
+## 5. Show the notes
+
+Print `cliffnotes.md` in full in your reply (it is short by design), with the folder path and
+the step timings from `source.json → timings_seconds` if you ran transcribe.
