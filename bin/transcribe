@@ -468,7 +468,13 @@ def main() -> None:
         words, n_stut = remove_stutters(words)
         gl_paths = [Path(p) for p in a.glossary] + [Path.cwd() / "glossary.txt", HOME / "glossary.txt"]
         gl_paths = list(dict.fromkeys(p.resolve() for p in gl_paths if p.exists()))
-        words, n_gl = apply_glossary(words, load_glossary(gl_paths))
+        rules = load_glossary(gl_paths)
+        n_gl = 0
+        for _ in range(3):  # rules can chain ("Lama" -> "Llama", then "Llama 270b" -> "Llama 2 70B")
+            words, n = apply_glossary(words, rules)
+            n_gl += n
+            if not n:
+                break
         words = tidy(words)
         sents = sentences(words)
         secs = sections(sents, a.section_target, a.section_min, a.section_max)

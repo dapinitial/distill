@@ -24,3 +24,26 @@ chat GPT → ChatGPT
 Lama 2 → Llama 2
 Lama 3 → Llama 3
 open AI → OpenAI
+ChachiPT → ChatGPT
+Chachi PT → ChatGPT
+Lama → Llama
+Lama 2 70B → Llama 2 70B
+Llama 270b → Llama 2 70B
+Llama 270 → Llama 2 70
+Elo
+Bard
+Mistral
+Mixtral
+LAMA2 → Llama 2
+Chash GPT → ChatGPT
+cloud series from Anthropic → Claude series from Anthropic
+reversal course → reversal curse
+Director Scott → director's cut
+ScaleAI → Scale AI
+scale AI → Scale AI
+shell brick → jailbreak
+backdark → backdoor
+BART series → Bard series
+cloud series → Claude series
+LM security → LLM security
+an LM might → an LLM might
