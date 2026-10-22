@@ -35,7 +35,11 @@ mapfile -t ITEMS < <(grep -vE '^\s*(#|$)' "$QUEUE")
 [[ ${#ITEMS[@]} -gt 0 ]] || { log "queue empty"; exit 0; }
 log "batch start: ${#ITEMS[@]} item(s)"
 
-TOOLS="Bash(transcribe:*) Bash(verify-quotes:*) Bash(where:*) Bash(stamp:*) Bash(render:*) Bash(library:*) Read Write Edit"
+# Claude may call a script bare, as bin/x, or by absolute path; allow all three spellings.
+TOOLS="Read Write Edit"
+for t in transcribe verify-quotes where stamp render library glossary-suggest; do
+  TOOLS="$TOOLS Bash($t:*) Bash(bin/$t:*) Bash($HOME_DIR/bin/$t:*)"
+done
 [[ $PUBLISH -eq 1 ]] && TOOLS="$TOOLS Artifact"
 
 notes_for() {  # $1 = transcript folder

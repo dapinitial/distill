@@ -12,6 +12,7 @@ with no player at all.
 from __future__ import annotations
 
 import argparse
+import base64
 import html
 import json
 import re
@@ -113,11 +114,40 @@ def md_to_html(md: str, url_base: str | None) -> str:
     return "\n".join(out)
 
 
+def video_file(folder: Path) -> Path | None:
+    for pat in ("media/video.*", "*.mp4", "*.mov", "*.mkv", "*.webm"):
+        for p in sorted(folder.glob(pat)):
+            if p.suffix != ".part" and not p.name.startswith("audio."):
+                return p
+    src = (folder / "source.json")
+    if src.exists():
+        path = json.loads(src.read_text()).get("path")
+        if path and Path(path).suffix.lower() in (".mp4", ".mov", ".mkv", ".webm", ".m4v") and Path(path).exists():
+            return Path(path)
+    return None
+
+
+def grab_frames(video: Path, folder: Path, times: list[float], width: int = 480) -> dict[int, str]:
+    """One JPEG per time (cached in <folder>/frames/), returned as data URIs keyed by second."""
+    out: dict[int, str] = {}
+    fdir = folder / "frames"
+    fdir.mkdir(exist_ok=True)
+    for t in sorted({int(t) for t in times}):
+        jpg = fdir / f"{t:06d}.jpg"
+        if not jpg.exists():
+            r = subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-ss", str(t + 1), "-i", str(video), "-frames:v", "1",
+                                "-vf", f"scale={width}:-2", "-q:v", "6", str(jpg)])
+            if r.returncode or not jpg.exists():
+                continue
+        out[t] = "data:image/jpeg;base64," + base64.b64encode(jpg.read_bytes()).decode()
+    return out
+
+
 def slug_id(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-") or "section"
 
 
-def transcript_html(md: str, url_base: str | None, hours: bool) -> tuple[str, list[dict]]:
+def transcript_html(md: str, url_base: str | None, hours: bool, frames: dict[int, str] | None = None) -> tuple[str, list[dict]]:
     """Sections and paragraphs from transcript.md. Returns (html, paragraph starts)."""
     out: list[str] = []
     paras: list[dict] = []
@@ -130,6 +160,10 @@ def transcript_html(md: str, url_base: str | None, hours: bool) -> tuple[str, li
             ttl_html = f' <span class="ttl">{esc(ttl)}</span>' if ttl else ""
             out.append(f'<section id="s-{n}"><h3><span class="n">{n}</span> {ts_anchor(a, parse_hms(a), url_base)} – '
                        f'{ts_anchor(b, parse_hms(b), url_base)}{ttl_html} <span class="dur">{hms(parse_hms(b) - parse_hms(a))}</span></h3>')
+            fr = (frames or {}).get(int(parse_hms(a)))
+            if fr:
+                out.append(f'<a class="frame" data-t="{int(parse_hms(a))}" href="{esc((url_base + "&t=" + str(int(parse_hms(a)))) if url_base else "#t-" + str(int(parse_hms(a))))}"'
+                           f'{" target=_blank rel=noopener" if url_base else ""}><img src="{fr}" alt="frame at {esc(a)}" loading="lazy"></a>')
             open_sec = True
         elif m := re.match(rf"^\[({TS})\] (.*)$", line):
             t = parse_hms(m.group(1))
@@ -196,6 +230,8 @@ button:focus-visible, a:focus-visible, input:focus-visible { outline: 2px solid 
 .ts { font: .8rem/1 var(--mono); color: var(--accent); text-decoration: none; white-space: nowrap; font-variant-numeric: tabular-nums }
 .ts:hover { text-decoration: underline }
 .para .ts { display: inline-block; min-width: 3.6em; margin-right: 6px }
+.frame { display: block; margin: 4px 0 10px; max-width: 360px } .frame img { width: 100%; border-radius: 4px; border: 1px solid var(--line); display: block }
+.frame.small { max-width: 240px; float: right; margin: 0 0 6px 10px } .notes li:has(.frame.small) { overflow: hidden }
 mark { background: var(--mark); color: inherit; border-radius: 2px; padding: 0 1px }
 .toast { position: fixed; left: 50%; bottom: calc(24px + env(safe-area-inset-bottom, 0px)); transform: translateX(-50%); background: var(--fg); color: var(--bg); padding: 8px 14px; border-radius: 6px; font-size: .9rem; opacity: 0; transition: opacity .2s; pointer-events: none }
 .toast.show { opacity: 1 }
@@ -296,6 +332,7 @@ def main() -> None:
     ap.add_argument("--standalone", action="store_true", help="complete HTML document with an embedded player")
     ap.add_argument("--open", action="store_true", help="imply --standalone and open the page")
     ap.add_argument("--out", help="output path (default <folder>/index.html)")
+    ap.add_argument("--no-frames", action="store_true", help="skip frame grabs even when the video is present")
     a = ap.parse_args()
     standalone = a.standalone or a.open
     folder = find_transcript_dir(a.folder)
@@ -320,8 +357,22 @@ def main() -> None:
         notes_lines = notes_lines[1:]
     notes_html = md_to_html("\n".join(notes_lines), url_base) if notes_md else \
         "<p>No cliff notes yet. Run the cliffnotes skill on this folder.</p>"
-    t_html, paras = transcript_html(transcript_md, url_base, hours)
+    frames: dict[int, str] = {}
+    vid_file = None if a.no_frames else video_file(folder)
+    if vid_file:
+        sec_starts = [parse_hms(m.group(1)) for m in re.finditer(rf"^## \d+\. \[({TS})", transcript_md, re.M)]
+        ww = [parse_hms(m.group(1)) for m in re.finditer(rf"^- \[({TS})[-\u2013]", notes_md[notes_md.find("## Worth watching"):notes_md.find("## Safe to skip")] if "## Worth watching" in notes_md else "", re.M)]
+        frames = grab_frames(vid_file, folder, sec_starts + ww)
+    t_html, paras = transcript_html(transcript_md, url_base, hours, frames)
 
+    if frames and "Worth watching" in notes_html:
+        def add_thumb(m):
+            t = int(m.group(2))
+            fr = frames.get(t)
+            return m.group(0) if not fr else m.group(1) + f'<a class="frame small" data-t="{t}" href="{m.group(3)}"{m.group(4)}><img src="{fr}" alt="" loading="lazy"></a>' + m.group(5)
+        head, _, tail = notes_html.partition('<h2 id="worth-watching">')
+        tail = re.sub(r'(<li>)(?=<a class="ts" data-t="(\d+)" href="([^"]+)"([^>]*)>)(.*?)(?=</li>)', add_thumb, tail, flags=re.S)
+        notes_html = head + '<h2 id="worth-watching">' + tail
     meta = [f"<span>{hms(duration, hours)}</span>", f"<span>{len(data['words']):,} words</span>",
             f"<span>{len(paras)} paragraphs</span>", f"<span>{esc(src.get('model', 'whisper'))}</span>", "<span>no speaker labels</span>"]
     if url:

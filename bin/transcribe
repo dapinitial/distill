@@ -89,12 +89,16 @@ def resolve_source(inp: str, out_root: Path, slug_override: str | None, force: b
             log(f"  download: skipped, have {media.name}")
         else:
             def dl():
-                fmt = "bestvideo[height<=720]+bestaudio/best[height<=720]/best" if video else "bestaudio/best"
-                run(["yt-dlp", "--no-playlist", "--no-warnings", "--quiet", "--no-progress", "-f", fmt,
+                run(["yt-dlp", "--no-playlist", "--no-warnings", "--quiet", "--no-progress", "-f", "bestaudio/best",
                      "--write-subs", "--write-auto-subs", "--sub-langs", "en.*,en", "--sub-format", "vtt",
                      "-o", str(media_dir / "audio.%(ext)s"), inp])
                 return [p for p in media_dir.glob("audio.*") if p.suffix not in (".part", ".vtt")][0]
             media = timer.step("download", dl)
+        have_video = [p for p in media_dir.glob("video.*") if p.suffix != ".part"]
+        if video and (not have_video or force):
+            timer.step("video", lambda: run(["yt-dlp", "--no-playlist", "--no-warnings", "--quiet", "--no-progress",
+                                             "-f", "bestvideo[height<=720]+bestaudio/best[height<=720]/best",
+                                             "-o", str(media_dir / "video.%(ext)s"), inp]))
         source = {
             "title": title,
             "url": info.get("webpage_url") or inp,
