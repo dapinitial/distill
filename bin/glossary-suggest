@@ -1,0 +1,184 @@
+#!/usr/bin/env python3
+"""glossary-suggest: find names and terms Whisper probably got wrong, and print glossary lines.
+
+  glossary-suggest <transcript folder> [--min-p 0.3] [--no-captions]
+
+Three deterministic signals, nothing is applied automatically:
+  1. spelling clusters: capitalized or digit-bearing words (not sentence-initial) that appear in
+     several near-identical spellings (LAMA2 / Lama 2 / Llama 2) -> "variant → most common form"
+  2. captions disagree: where the creator's or YouTube's captions (media/*.vtt, fetched by
+     transcribe) spell a capitalized word or a number differently from Whisper
+  3. low confidence: words Whisper itself doubted (p below --min-p), with time and context
+Paste the lines you agree with into glossary.txt and rerun transcribe (seconds, Whisper is cached).
+"""
+from __future__ import annotations
+
+import argparse
+import difflib
+import json
+import re
+import sys
+from collections import Counter, defaultdict
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from distill_common import find_transcript_dir, hms, load_transcript, norm_token, norm_tokens  # noqa: E402
+
+HOME = Path(__file__).resolve().parent.parent
+CAP_WORD = re.compile(r"[A-Z]")
+DIGIT = re.compile(r"\d")
+STOP_CAPS = {"i", "i'm", "i've", "i'd", "i'll", "ok", "okay", "tv", "ai", "us", "uk", "gpu", "gpus", "llm", "llms", "ram", "cpu", "api"}
+
+
+def existing_glossary() -> set[str]:
+    known = set()
+    for p in (Path.cwd() / "glossary.txt", HOME / "glossary.txt"):
+        if p.exists():
+            for line in p.read_text().splitlines():
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    for part in re.split(r"\s*(?:→|->|=>)\s*", line):
+                        known.add(" ".join(norm_tokens(part)))
+    return known
+
+
+def clusters(words: list[dict], known: set[str]) -> list[str]:
+    forms: Counter = Counter()
+    for i, w in enumerate(words):
+        raw = w["word"]
+        core = re.sub(r"^[^\w$]+|[^\w%]+$", "", raw)
+        if not core or norm_token(core) in STOP_CAPS or not re.search(r"[A-Za-z]", core):
+            continue
+        sentence_initial = i == 0 or re.search(r"[.?!][\"')\]]*$", words[i - 1]["word"]) is not None
+        if (CAP_WORD.search(core[1:]) or DIGIT.search(core) or (core[0].isupper() and not sentence_initial)):
+            forms[core] += 1
+    keys = {f: re.sub(r"[^a-z0-9]", "", f.lower()) for f in forms}
+    names = list(forms)
+    parent = {n: n for n in names}
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]; x = parent[x]
+        return x
+
+    for a_i, a in enumerate(names):
+        for b in names[a_i + 1:]:
+            ka, kb = keys[a], keys[b]
+            if ka == kb and a != b:
+                parent[find(a)] = find(b); continue
+            if min(len(ka), len(kb)) < 4 or abs(len(ka) - len(kb)) > 3:
+                continue
+            if difflib.SequenceMatcher(None, ka, kb).ratio() >= 0.8 and ka[0] == kb[0]:
+                parent[find(a)] = find(b)
+    groups: dict[str, list[str]] = defaultdict(list)
+    for n in names:
+        groups[find(n)].append(n)
+    out = []
+    for g in groups.values():
+        if len(g) < 2:
+            continue
+        g.sort(key=lambda f: (-forms[f], f.isupper(), -len(f)))  # most common; mixed case beats ALL CAPS
+        canon = g[0]
+        for v in g[1:]:
+            if " ".join(norm_tokens(v)) in known or norm_token(v) == norm_token(canon):
+                continue  # already handled, or only a case difference the glossary line already fixes
+            if keys[v] == keys[canon] + "s" or keys[canon] == keys[v] + "s":
+                continue  # plural or possessive of the same name
+            out.append(f"{v} → {canon}    # {forms[v]}x vs {forms[canon]}x")
+    return out
+
+
+def caption_words(vtt: Path) -> list[tuple[float, str]]:
+    out = []
+    for line in vtt.read_text(errors="ignore").splitlines():
+        if "<c>" not in line:
+            continue
+        # "hi<00:00:00.320><c> everyone</c><00:00:01.280><c> so</c>"
+        m = re.match(r"^([^<]+)<(\d+):(\d+):(\d+)\.(\d+)>", line)
+        if m:
+            t0 = int(m.group(2)) * 3600 + int(m.group(3)) * 60 + int(m.group(4)) + int(m.group(5)) / 1000
+            out.append((t0, m.group(1).strip()))
+        for tm, w in re.findall(r"<(\d+:\d+:\d+\.\d+)><c>\s*([^<]+)</c>", line):
+            h, mnt, s = tm.split(":")
+            out.append((int(h) * 3600 + int(mnt) * 60 + float(s), w.strip()))
+    return out
+
+
+NUMWORDS = {"zero": "0", "one": "1", "two": "2", "three": "3", "four": "4", "five": "5", "six": "6", "seven": "7",
+            "eight": "8", "nine": "9", "ten": "10", "twenty": "20", "thirty": "30", "forty": "40", "fifty": "50",
+            "hundred": "100", "thousand": "1000"}
+
+
+def squash(s: str) -> str:
+    """Case, hyphens, spaces and number words don't count as disagreement."""
+    toks = [NUMWORDS.get(t, t) for t in norm_tokens(s)]
+    return re.sub(r"[^a-z0-9]", "", "".join(toks).lower())
+
+
+def caption_diffs(words: list[dict], caps: list[tuple[float, str]], sections: list[dict], known: set[str]) -> list[str]:
+    out = []
+    seen = set()
+    for sec in sections:
+        ws = [w for w in words if sec["start"] <= w["start"] < sec["end"]]
+        cs = [c for c in caps if sec["start"] - 2 <= c[0] < sec["end"] + 2]
+        if not ws or not cs:
+            continue
+        a = [norm_token(w["word"]) for w in ws]
+        b = [norm_token(c[1]) for c in cs]
+        sm = difflib.SequenceMatcher(None, a, b, autojunk=False)
+        for tag, i1, i2, j1, j2 in sm.get_opcodes():
+            if tag != "replace" or i2 - i1 > 3 or j2 - j1 > 3:
+                continue
+            wside = " ".join(w["word"].strip(".,!?;:\"'") for w in ws[i1:i2])
+            cside = " ".join(c[1] for c in cs[j1:j2])
+            interesting = CAP_WORD.search(cside) or DIGIT.search(cside) or DIGIT.search(wside)
+            if not interesting or squash(wside) == squash(cside) or " ".join(norm_tokens(wside)) in known:
+                continue
+            key = (wside.lower(), cside.lower())
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(f"{wside} → {cside}    # captions, at {hms(ws[i1]['start'])}")
+    return out
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("folder")
+    ap.add_argument("--min-p", type=float, default=0.3)
+    ap.add_argument("--no-captions", action="store_true")
+    ap.add_argument("--include-known", action="store_true", help="also list terms the glossary already covers")
+    a = ap.parse_args()
+    folder = find_transcript_dir(a.folder)
+    data = load_transcript(folder)
+    words = data["words"]
+    src = data.get("source") or {}
+    known = set() if a.include_known else existing_glossary()
+
+    print("# 1. Spelling clusters (variant → most common form). Check each before pasting.")
+    cl = clusters(words, known)
+    print("\n".join(cl) if cl else "# none")
+
+    vtt = src.get("captions")
+    vtts = sorted(folder.glob("media/*.vtt"))
+    print("\n# 2. Captions disagree with Whisper (capitalized words and numbers only)")
+    if a.no_captions or not vtts:
+        print("# no captions file; transcribe fetches YouTube's when available")
+    else:
+        pick = folder / vtt if vtt and (folder / vtt).exists() else vtts[0]
+        diffs = caption_diffs(words, caption_words(pick), data["sections"], known)
+        print("\n".join(diffs[:40]) if diffs else "# none")
+        if len(diffs) > 40:
+            print(f"# … {len(diffs) - 40} more")
+
+    print(f"\n# 3. Low-confidence words (p < {a.min_p}); not glossary lines, just places to listen")
+    low = [(i, w) for i, w in enumerate(words) if w.get("p", 1) < a.min_p]
+    for i, w in low[:40]:
+        ctx = " ".join(x["word"] for x in words[max(0, i - 4): i + 5])
+        print(f"# [{hms(w['start'])}] {w['word']} (p={w['p']}): …{ctx}…")
+    if not low:
+        print("# none")
+
+
+if __name__ == "__main__":
+    main()

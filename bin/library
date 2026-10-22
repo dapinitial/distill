@@ -1,0 +1,120 @@
+#!/usr/bin/env python3
+"""library: index every transcript folder under $DISTILL_OUT.
+
+  library [--out DIR] [--open]
+
+Writes <out>/index.md (for agents) and <out>/index.html (for people): title, date, duration,
+the point from the cliff notes, and links to the folder, the page and the source.
+"""
+from __future__ import annotations
+
+import argparse
+import html
+import json
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from distill_common import hms  # noqa: E402
+
+HOME = Path(os.environ.get("DISTILL_HOME", Path(__file__).resolve().parent.parent))
+
+
+def the_point(notes: str) -> str:
+    m = re.search(r"^## The point\s*\n(.+?)(?:\n## |\Z)", notes, re.S | re.M)
+    return re.sub(r"\s+", " ", m.group(1)).strip() if m else ""
+
+
+def entries(root: Path) -> list[dict]:
+    out = []
+    for src_path in sorted(root.glob("*/source.json")):
+        folder = src_path.parent
+        src = json.loads(src_path.read_text())
+        notes_path = folder / "cliffnotes.md"
+        notes = notes_path.read_text() if notes_path.exists() else ""
+        out.append({
+            "slug": folder.name, "title": src.get("title") or folder.name, "url": src.get("url"),
+            "uploader": src.get("uploader"), "duration": float(src.get("duration") or 0),
+            "created": (src.get("created_at") or "")[:10], "words": src.get("word_count", 0),
+            "point": the_point(notes), "has_notes": bool(notes), "has_page": (folder / "index.html").exists(),
+            "artifact": json.loads((folder / "artifact.json").read_text()).get("url") if (folder / "artifact.json").exists() else None,
+        })
+    out.sort(key=lambda e: e["created"], reverse=True)
+    return out
+
+
+def write_md(root: Path, items: list[dict]) -> None:
+    lines = ["# distill library", "", f"{len(items)} transcripts under `{root}`. Newest first.", ""]
+    for e in items:
+        head = f"## {e['title']}"
+        meta = [e["created"], hms(e["duration"]), f"{e['words']:,} words"]
+        if e["uploader"]:
+            meta.insert(1, e["uploader"])
+        links = [f"[folder]({e['slug']}/)"]
+        if e["has_notes"]:
+            links.append(f"[cliff notes]({e['slug']}/cliffnotes.md)")
+        if e["url"]:
+            links.append(f"[source]({e['url']})")
+        if e["artifact"]:
+            links.append(f"[artifact]({e['artifact']})")
+        lines += [head, "", " · ".join(meta) + " · " + " · ".join(links), ""]
+        lines += [e["point"] or "_No cliff notes yet._", ""]
+    (root / "index.md").write_text("\n".join(lines))
+
+
+def write_html(root: Path, items: list[dict]) -> None:
+    esc = lambda s: html.escape(str(s), quote=True)  # noqa: E731
+    cards = []
+    for e in items:
+        links = [f'<a href="{esc(e["slug"])}/local.html">page</a>' if (root / e["slug"] / "local.html").exists() else ""]
+        if e["has_notes"]:
+            links.append(f'<a href="{esc(e["slug"])}/cliffnotes.md">notes</a>')
+        if e["url"]:
+            links.append(f'<a href="{esc(e["url"])}" target="_blank" rel="noopener">source ↗</a>')
+        if e["artifact"]:
+            links.append(f'<a href="{esc(e["artifact"])}" target="_blank" rel="noopener">artifact ↗</a>')
+        cards.append(f'''<article>
+  <h2>{esc(e["title"])}</h2>
+  <div class="meta"><span>{esc(e["created"])}</span>{f'<span>{esc(e["uploader"])}</span>' if e["uploader"] else ""}<span>{hms(e["duration"])}</span><span>{e["words"]:,} words</span></div>
+  <p>{esc(e["point"]) if e["point"] else "<em>No cliff notes yet.</em>"}</p>
+  <div class="links">{" ".join(l for l in links if l)}</div>
+</article>''')
+    page = f"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>distill library</title>
+<style>
+:root {{ --bg:#f5f6f8; --panel:#fff; --fg:#1c2029; --muted:#6a7282; --line:#dfe3ea; --accent:#0d6b70 }}
+@media (prefers-color-scheme: dark) {{ :root {{ --bg:#13161d; --panel:#1b1f28; --fg:#e4e7ee; --muted:#949caf; --line:#2b313d; --accent:#5cc8cc; color-scheme: dark }} }}
+body {{ margin:0; background:var(--bg); color:var(--fg); font:16px/1.5 "IBM Plex Sans", -apple-system, Helvetica, Arial, sans-serif; padding: 24px max(16px, 4vw) 48px }}
+h1 {{ font: 600 1.6rem/1.2 "IBM Plex Serif", Georgia, serif; margin: 0 0 4px }} .sub {{ color: var(--muted); margin: 0 0 24px }}
+.grid {{ display:grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 16px }}
+article {{ background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 16px 18px; min-width: 0 }}
+article h2 {{ font: 600 1.05rem/1.3 inherit; margin: 0 0 6px; text-wrap: balance }}
+.meta {{ color: var(--muted); font-size: .85rem; display:flex; flex-wrap:wrap; gap: 4px 14px; margin-bottom: 8px }}
+article p {{ margin: 0 0 10px; font-size: .95rem }} .links a {{ color: var(--accent); margin-right: 12px; font-size: .9rem }}
+</style></head><body>
+<h1>distill library</h1><p class="sub">{len(items)} transcripts · newest first</p>
+<div class="grid">{''.join(cards)}</div>
+</body></html>
+"""
+    (root / "index.html").write_text(page)
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--out", default=os.environ.get("DISTILL_OUT", str(HOME / "out")))
+    ap.add_argument("--open", action="store_true")
+    a = ap.parse_args()
+    root = Path(a.out).expanduser()
+    items = entries(root)
+    write_md(root, items)
+    write_html(root, items)
+    print(f"{root / 'index.md'}\n{root / 'index.html'}  ({len(items)} transcripts)")
+    if a.open:
+        subprocess.run(["open", str(root / "index.html")])
+
+
+if __name__ == "__main__":
+    main()

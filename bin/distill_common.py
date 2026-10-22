@@ -26,7 +26,7 @@ def parse_hms(text: str) -> float:
     return float(total)
 
 
-_QUOTES = {"“": '"', "”": '"', "‘": "'", "’": "'", "–": "-", "—": "-", "…": "..."}
+_QUOTES = {"“": '"', "”": '"', "‘": "'", "’": "'", "–": " - ", "—": " - ", "…": "..."}
 
 
 def ascii_punct(text: str) -> str:

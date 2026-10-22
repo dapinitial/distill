@@ -12,3 +12,4 @@ out/
 __pycache__/
 .venv/
 node_modules/
+queue.done.txt

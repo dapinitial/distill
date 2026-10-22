@@ -2,10 +2,12 @@
 """where: find when something was said.
 
   where <transcript folder> "phrase" ["phrase" ...]
+  where --all "phrase" ["phrase" ...]        # every transcript under $DISTILL_OUT
 
 Prints the timestamp marker (a YouTube link when the source is YouTube) and a little context for
 every occurrence, so cliff-notes items and quotes get real times instead of guessed ones.
 """
+import os
 import sys
 from pathlib import Path
 
@@ -14,21 +16,31 @@ from distill_common import find_transcript_dir, load_transcript, norm_tokens, st
 
 if len(sys.argv) < 3:
     sys.exit(__doc__)
-data = load_transcript(find_transcript_dir(sys.argv[1]))
-source = data.get("source") or {"url": data.get("url")}
-words = data["words"]
-hay, back = [], []
-for i, w in enumerate(words):
-    for t in norm_tokens(w["word"]):
-        hay.append(t); back.append(i)
-for phrase in sys.argv[2:]:
-    needle = norm_tokens(phrase)
-    n = len(needle)
-    hits = [i for i in range(len(hay) - n + 1) if hay[i:i + n] == needle]
-    if not hits:
-        print(f'--  "{phrase}": not found')
-        continue
-    for h in hits[:5]:
-        wi = back[h]
-        ctx = " ".join(x["word"] for x in words[max(0, wi - 6): wi + n + 8])
-        print(f'{stamp(words[wi]["start"], source)}  …{ctx}…')
+if sys.argv[1] == "--all":
+    root = Path(os.environ.get("DISTILL_OUT", Path(__file__).resolve().parent.parent / "out"))
+    folders = sorted(p.parent for p in root.glob("*/transcript.json"))
+else:
+    folders = [find_transcript_dir(sys.argv[1])]
+phrases = sys.argv[2:]
+for folder in folders:
+    data = load_transcript(folder)
+    source = data.get("source") or {"url": data.get("url")}
+    words = data["words"]
+    hay, back = [], []
+    for i, w in enumerate(words):
+        for t in norm_tokens(w["word"]):
+            hay.append(t); back.append(i)
+    for phrase in phrases:
+        needle = norm_tokens(phrase)
+        n = len(needle)
+        hits = [i for i in range(len(hay) - n + 1) if hay[i:i + n] == needle]
+        if not hits:
+            if len(folders) == 1:
+                print(f'--  "{phrase}": not found')
+            continue
+        if len(folders) > 1:
+            print(f"# {source.get('title') or folder.name}  ({folder.name}, {len(hits)} hits)")
+        for h in hits[:5]:
+            wi = back[h]
+            ctx = " ".join(x["word"] for x in words[max(0, wi - 6): wi + n + 8])
+            print(f'{stamp(words[wi]["start"], source)}  …{ctx}…')

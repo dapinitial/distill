@@ -1,0 +1,126 @@
+#!/usr/bin/env python3
+"""test: regression checks for the deterministic cleanup rules and the quote verifier.
+
+  test            # exit 0 when every case passes
+
+The cleanup rules are the contract that lets verify-quotes be strict, so every rule has a case
+here. Add one whenever a rule changes.
+"""
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+os.environ.setdefault("DISTILL_HOME", str(HERE.parent))
+
+src = (HERE / "transcribe").read_text()
+T: dict = {"__name__": "transcribe_under_test", "__file__": str(HERE / "transcribe")}
+exec(compile(src, "transcribe", "exec"), T)
+from distill_common import hms, norm_tokens, parse_hms, slugify, stamp  # noqa: E402
+
+FAILS = 0
+
+
+def check(name: str, got, want) -> None:
+    global FAILS
+    ok = got == want
+    FAILS += not ok
+    print(f"{'ok  ' if ok else 'FAIL'} {name}" + ("" if ok else f"\n       got:  {got!r}\n       want: {want!r}"))
+
+
+def W(text: str, gap: float = 0.5) -> list[dict]:
+    return [{"word": w, "start": round(i * gap, 2), "end": round(i * gap + 0.4, 2), "p": 0.9} for i, w in enumerate(text.split())]
+
+
+def text(words) -> str:
+    return " ".join(w["word"] for w in words)
+
+
+# --- cleanup ----------------------------------------------------------------------------------
+w, n = T["remove_fillers"](W("Um, so I think, uh, yes."))
+check("fillers removed, punctuation kept", (text(w), n), ("so I think, yes.", 2))
+
+w, n = T["remove_stutters"](W("I I I think you know you know the the best"))
+check("stutters collapse to one copy", (text(w), n), ("I think you know the best", 5))
+check("stutter keeps the first start time", (w[0]["start"], w[0]["word"]), (0.0, "I"))
+
+w, _ = T["remove_stutters"](W("I know that that is true. No. No. very very good"))
+check("legit doubles and punctuated emphasis survive", text(w), "I know that that is true. No. No. very very good")
+
+with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as f:
+    f.write("# comment\nChatGPT\nchat GPT → ChatGPT\nLama → Llama\nLlama 270b → Llama 2 70B\nClaude Code\n")
+    gl = Path(f.name)
+rules = T["load_glossary"]([gl])
+w = W("I use chat GPT, claude code and Lama 270b daily.")
+total = 0
+for _ in range(3):
+    w, n = T["apply_glossary"](w, rules)
+    total += n
+    if not n:
+        break
+check("glossary: case, multi-word, chained rules", text(w), "I use ChatGPT, Claude Code and Llama 2 70B daily.")
+check("glossary keeps the span's time range", (w[2]["start"], w[8]["end"]), (1.0, 4.4))
+gl.unlink()
+
+w = T["tidy"](W("hello , world"))
+check("tidy glues a lone comma to the previous word", text(w), "hello, world")
+
+fake = {"transcription": [
+    {"text": " Credits here", "tokens": [{"text": " Credits", "id": 1, "p": 0.05, "offsets": {"from": 100, "to": 400}},
+                                        {"text": " here", "id": 2, "p": 0.9, "offsets": {"from": 400, "to": 700}}]},
+    {"text": " Real speech starts.", "tokens": [{"text": "[_BEG_]", "id": 50365, "p": 0.3, "offsets": {"from": 9000, "to": 9000}},
+                                              {"text": " Real", "id": 3, "p": 0.9, "offsets": {"from": 9000, "to": 9300}},
+                                              {"text": " speech", "id": 4, "p": 0.9, "offsets": {"from": 9300, "to": 9700}},
+                                              {"text": " starts", "id": 5, "p": 0.9, "offsets": {"from": 9700, "to": 9900}},
+                                              {"text": ".", "id": 6, "p": 0.9, "offsets": {"from": 9900, "to": 9950}}]},
+    {"text": " [Music]", "tokens": [{"text": " [Music]", "id": 7, "p": 0.9, "offsets": {"from": 10000, "to": 10500}}]},
+]}
+words, dropped = T["words_from_whisper"](fake)
+check("suspect isolated low-confidence intro dropped, [Music] dropped, punctuation merged",
+      (text(words), [d["text"] for d in dropped]), ("Real speech starts.", ["Credits here"]))
+
+# --- sentences and sections -------------------------------------------------------------------
+sents = T["sentences"](W("One two. Three four? Five six"))
+check("sentences end at .?! and at the end", [s["text"] for s in sents], ["One two.", "Three four?", "Five six"])
+long = W(" ".join(f"w{i}." for i in range(400)), gap=1.0)  # 400 one-word sentences, 1 s apart
+secs = T["sections"](T["sentences"](long), 180, 90, 300)
+check("sections stay between min and max", all(90 <= s[-1]["end"] - s[0]["start"] <= 300 for s in secs[:-1]), True)
+chapters = [{"title": "A", "start": 0, "end": 100}, {"title": "B", "start": 100, "end": 400}]
+secs = T["sections_from_chapters"](T["sentences"](long), chapters, 180, 90, 300)
+check("chapter marks become section starts with titles", [(round(s[0]["start"]), s[0].get("chapter")) for s in secs][:2], [(0, "A"), (100, "B")])
+
+# --- helpers -----------------------------------------------------------------------------------
+check("hms", (hms(5), hms(754), hms(3725)), ("00:05", "12:34", "1:02:05"))
+check("parse_hms", (parse_hms("12:34"), parse_hms("1:02:05")), (754.0, 3725.0))
+check("slugify trims at a word", slugify("A very long title that goes on and on and on forever and ever amen", 40), "a-very-long-title-that-goes-on-and-on")
+check("norm_tokens straightens quotes and strips punctuation", norm_tokens("“It’s—fine,” he said."), ["it's", "fine", "he", "said"])
+check("stamp links YouTube", stamp(754, {"url": "https://youtu.be/abcdefghijk"}), "[12:34](https://www.youtube.com/watch?v=abcdefghijk&t=754)")
+
+# --- verify-quotes end to end --------------------------------------------------------------------
+with tempfile.TemporaryDirectory() as d:
+    folder = Path(d)
+    words = W("We vote for politicians with lower voices. It's true. Because we associate depth with power.", gap=1.0)
+    (folder / "transcript.json").write_text(json.dumps({"title": "t", "url": "https://www.youtube.com/watch?v=abcdefghijk",
+                                                        "duration": 60, "words": words, "sections": []}))
+    (folder / "source.json").write_text(json.dumps({"title": "t", "url": "https://www.youtube.com/watch?v=abcdefghijk", "duration": 60}))
+    notes = '\n'.join([
+        '> "We vote for politicians with lower voices." — [00:00](https://www.youtube.com/watch?v=abcdefghijk&t=0)',
+        '> "we associate depth with power" — [00:10](https://www.youtube.com/watch?v=abcdefghijk&t=10)',
+        '> "We vote for the politicians" — [00:00]',          # paraphrase
+        '- [02:00](https://www.youtube.com/watch?v=abcdefghijk&t=120) past the end',
+        '- [00:05](https://www.youtube.com/watch?v=abcdefghijk&t=50) mismatch',
+    ])
+    (folder / "cliffnotes.md").write_text(notes)
+    r = subprocess.run([sys.executable, str(HERE / "verify-quotes"), str(folder)], capture_output=True, text=True)
+    lines = r.stdout.splitlines()
+    check("verify-quotes: 2 ok, 4 fails (paraphrase, [02:00] and t=120 past the end, mismatch), exit 1",
+          (sum(l.startswith("OK") for l in lines), sum(l.startswith("FAIL") for l in lines), r.returncode), (2, 4, 1))
+
+print(f"\n{'all passed' if not FAILS else f'{FAILS} failed'}")
+sys.exit(1 if FAILS else 0)

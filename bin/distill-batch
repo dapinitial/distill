@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+# distill-batch: work through a queue unattended. transcribe each item, then run the cliffnotes
+# skill headlessly in Claude Code, then refresh the library index.
+#
+#   distill-batch [queue.txt] [--publish] [--redo] [--dry-run]
+#
+# queue.txt: one URL, playlist URL or file path per line; "#" comments; blank lines ignored.
+# Finished lines move to queue.done.txt with a timestamp and result. Log: $DISTILL_OUT/batch.log.
+# Scheduling (not installed for you): a launchd/cron line such as
+#   0 6 * * *  cd ~/Sites/distill && direnv exec . bin/distill-batch >> out/cron.log 2>&1
+# or a Claude Code routine via /schedule that runs the same command.
+set -uo pipefail
+
+HOME_DIR="${DISTILL_HOME:-$(cd "$(dirname "$0")/.." && pwd)}"
+export DISTILL_HOME="$HOME_DIR"
+export DISTILL_OUT="${DISTILL_OUT:-$HOME_DIR/out}"
+export DISTILL_MODELS="${DISTILL_MODELS:-$HOME_DIR/models}"
+export DISTILL_MODEL="${DISTILL_MODEL:-$DISTILL_MODELS/ggml-large-v3-turbo.bin}"
+export PATH="$HOME_DIR/bin:/opt/homebrew/bin:$PATH"
+
+QUEUE="$HOME_DIR/queue.txt"; PUBLISH=0; REDO=0; DRY=0
+for arg in "$@"; do
+  case "$arg" in
+    --publish) PUBLISH=1 ;; --redo) REDO=1 ;; --dry-run) DRY=1 ;;
+    *) QUEUE="$arg" ;;
+  esac
+done
+DONE="${QUEUE%.txt}.done.txt"
+LOG="$DISTILL_OUT/batch.log"
+mkdir -p "$DISTILL_OUT"
+log() { printf '%s  %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" | tee -a "$LOG" >&2; }
+
+[[ -f "$QUEUE" ]] || { log "no queue at $QUEUE"; exit 0; }
+mapfile -t ITEMS < <(grep -vE '^\s*(#|$)' "$QUEUE")
+[[ ${#ITEMS[@]} -gt 0 ]] || { log "queue empty"; exit 0; }
+log "batch start: ${#ITEMS[@]} item(s)"
+
+TOOLS="Bash(transcribe:*) Bash(verify-quotes:*) Bash(where:*) Bash(stamp:*) Bash(render:*) Bash(library:*) Read Write Edit"
+[[ $PUBLISH -eq 1 ]] && TOOLS="$TOOLS Artifact"
+
+notes_for() {  # $1 = transcript folder
+  local folder="$1" prompt
+  prompt="/cliffnotes $folder"
+  [[ $PUBLISH -eq 1 ]] && prompt="$prompt — after verify-quotes passes, run render and publish index.html as an Artifact, then write {\"url\": \"<artifact url>\"} to $folder/artifact.json."
+  [[ $REDO -eq 1 ]] && prompt="$prompt (rewrite cliffnotes.md even though one exists)"
+  if [[ $DRY -eq 1 ]]; then log "would run: claude -p \"$prompt\""; return 0; fi
+  ( cd "$HOME_DIR" && claude -p "$prompt" --permission-mode acceptEdits --allowedTools $TOOLS --output-format text ) \
+    > "$folder/cliffnotes.run.log" 2>&1
+}
+
+ok=0; bad=0
+for item in "${ITEMS[@]}"; do
+  log "transcribe: $item"
+  if [[ $DRY -eq 1 ]]; then
+    folder="(dry run)"
+  else
+    folder="$(transcribe $item 2>>"$LOG" | tail -1)"
+    if [[ -z "$folder" || ! -f "$folder/transcript.json" ]]; then
+      log "FAILED transcribe: $item"; bad=$((bad+1)); printf '%s\tFAILED transcribe\t%s\n' "$(date +%F)" "$item" >> "$DONE"; continue
+    fi
+  fi
+  if [[ $DRY -eq 0 && -f "$folder/cliffnotes.md" && $REDO -eq 0 ]]; then
+    log "notes exist, skipping cliffnotes: $folder"
+  else
+    log "cliffnotes: $folder"
+    notes_for "$folder"
+  fi
+  if [[ $DRY -eq 1 ]] || verify-quotes "$folder/cliffnotes.md" >/dev/null 2>&1; then
+    ok=$((ok+1)); printf '%s\tok\t%s\t%s\n' "$(date +%F)" "$item" "$folder" >> "$DONE"
+    log "done: $folder"
+  else
+    bad=$((bad+1)); printf '%s\tFAILED notes\t%s\t%s\n' "$(date +%F)" "$item" "$folder" >> "$DONE"
+    log "FAILED notes (verify-quotes): $folder"
+  fi
+done
+# drop the processed lines from the queue, keep comments
+if [[ $DRY -eq 0 ]]; then
+  grep -E '^\s*(#|$)' "$QUEUE" > "$QUEUE.tmp" || true; mv "$QUEUE.tmp" "$QUEUE"
+fi
+library >/dev/null 2>&1 && log "library index refreshed"
+log "batch end: $ok ok, $bad failed"
+[[ $bad -eq 0 ]]
