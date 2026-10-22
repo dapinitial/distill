@@ -602,8 +602,8 @@ def main() -> None:
     ap.add_argument("--no-glossary", action="store_true", help="skip glossary rules (to see what Whisper said raw)")
     ap.add_argument("--speakers", nargs="?", const=-1, type=int, default=None, metavar="N",
                     help="label speakers (numbered, not named); give N when you know how many")
-    ap.add_argument("--speaker-threshold", type=float, default=0.5,
-                    help="clustering threshold when detecting speakers; lower splits more (0.3–0.8)")
+    ap.add_argument("--speaker-threshold", type=float, default=0.6,
+                    help="clustering threshold when detecting speakers; higher merges more (0.5–0.9)")
     ap.add_argument("--no-speakers", action="store_true", help="ignore an existing speakers.json")
     ap.add_argument("--prompt", default=PROMPT, help="initial prompt for Whisper; a punctuated sentence keeps it "
                     "producing punctuation and capitals, and it can carry names (see glossary) and jargon")

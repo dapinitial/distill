@@ -42,7 +42,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("wav")
     ap.add_argument("--speakers", type=int, default=-1, help="known number of speakers (default: detect)")
-    ap.add_argument("--threshold", type=float, default=0.5, help="clustering threshold when detecting; lower = more speakers")
+    ap.add_argument("--threshold", type=float, default=0.6, help="clustering threshold when detecting; lower = more speakers")
     a = ap.parse_args()
     seg = MODELS / "sherpa-onnx-pyannote-segmentation-3-0" / "model.onnx"
     emb = MODELS / "nemo_en_titanet_small.onnx"
