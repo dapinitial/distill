@@ -123,12 +123,13 @@ def transcript_html(md: str, url_base: str | None, hours: bool) -> tuple[str, li
     paras: list[dict] = []
     open_sec = False
     for line in md.splitlines():
-        if m := re.match(rf"^## (\d+)\. \[({TS})[-–]({TS})\]", line):
+        if m := re.match(rf"^## (\d+)\. \[({TS})[-–]({TS})\]\s*(.*)$", line):
             if open_sec:
                 out.append("</section>")
-            n, a, b = m.group(1), m.group(2), m.group(3)
+            n, a, b, ttl = m.group(1), m.group(2), m.group(3), m.group(4).strip()
+            ttl_html = f' <span class="ttl">{esc(ttl)}</span>' if ttl else ""
             out.append(f'<section id="s-{n}"><h3><span class="n">{n}</span> {ts_anchor(a, parse_hms(a), url_base)} – '
-                       f'{ts_anchor(b, parse_hms(b), url_base)} <span class="dur">{hms(parse_hms(b) - parse_hms(a))}</span></h3>')
+                       f'{ts_anchor(b, parse_hms(b), url_base)}{ttl_html} <span class="dur">{hms(parse_hms(b) - parse_hms(a))}</span></h3>')
             open_sec = True
         elif m := re.match(rf"^\[({TS})\] (.*)$", line):
             t = parse_hms(m.group(1))
@@ -187,6 +188,7 @@ button:focus-visible, a:focus-visible, input:focus-visible { outline: 2px solid 
 .transcript section { padding-block: 14px 6px }
 .transcript h3 { font: 500 .95rem/1.3 var(--body); margin: 10px 0 4px; display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; color: var(--muted) }
 .transcript h3 .n { font: 600 .75rem/1 var(--mono); color: var(--accent); border: 1px solid var(--accent); border-radius: 4px; padding: 3px 5px }
+.transcript h3 .ttl { color: var(--fg); font-weight: 600 }
 .transcript h3 .dur { font: .8rem var(--mono); margin-left: auto }
 .para { margin: 0 0 14px; padding: 8px 10px 8px 12px; border-left: 3px solid transparent; border-radius: 4px; max-width: 78ch; scroll-margin-top: 90px }
 .para.now { background: var(--now); border-left-color: var(--accent) }

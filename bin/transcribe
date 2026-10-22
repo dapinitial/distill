@@ -69,25 +69,31 @@ def probe_duration(path: Path) -> float:
     return float(json.loads(out)["format"]["duration"])
 
 
-def resolve_source(inp: str, out_root: Path, slug_override: str | None, force: bool, timer: Timer):
-    """Return (source dict, media path, out dir)."""
+def resolve_source(inp: str, out_root: Path, slug_override: str | None, force: bool, timer: Timer,
+                   playlist_ok: bool = False, video: bool = False):
+    """Return (source dict, media path, out dir); for a playlist, (info, None, None)."""
     if URL_RE.match(inp):
         info = json.loads(timer.step("probe", lambda: run(
-            ["yt-dlp", "--no-playlist", "--no-warnings", "-J", inp], capture_output=True).stdout))
+            ["yt-dlp", "--no-warnings", "-J", inp] + ([] if playlist_ok else ["--no-playlist"]),
+            capture_output=True).stdout))
+        if info.get("_type") == "playlist":
+            return info, None, None  # caller expands the entries
         title = info.get("title") or "untitled"
         slug = slug_override or slugify(title)
         out_dir = out_root / slug
         media_dir = out_dir / "media"
         media_dir.mkdir(parents=True, exist_ok=True)
-        existing = [p for p in media_dir.glob("audio.*") if p.suffix != ".part"]
+        existing = [p for p in media_dir.glob("audio.*") if p.suffix not in (".part", ".vtt")]
         if existing and not force:
             media = existing[0]
             log(f"  download: skipped, have {media.name}")
         else:
             def dl():
-                run(["yt-dlp", "--no-playlist", "--no-warnings", "--quiet", "--no-progress", "-f", "bestaudio/best",
+                fmt = "bestvideo[height<=720]+bestaudio/best[height<=720]/best" if video else "bestaudio/best"
+                run(["yt-dlp", "--no-playlist", "--no-warnings", "--quiet", "--no-progress", "-f", fmt,
+                     "--write-subs", "--write-auto-subs", "--sub-langs", "en.*,en", "--sub-format", "vtt",
                      "-o", str(media_dir / "audio.%(ext)s"), inp])
-                return [p for p in media_dir.glob("audio.*") if p.suffix != ".part"][0]
+                return [p for p in media_dir.glob("audio.*") if p.suffix not in (".part", ".vtt")][0]
             media = timer.step("download", dl)
         source = {
             "title": title,
@@ -98,6 +104,9 @@ def resolve_source(inp: str, out_root: Path, slug_override: str | None, force: b
             "id": info.get("id"),
             "uploader": info.get("uploader") or info.get("channel"),
             "upload_date": info.get("upload_date"),
+            "chapters": [{"title": c.get("title"), "start": float(c["start_time"]), "end": float(c["end_time"])}
+                         for c in (info.get("chapters") or [])],
+            "captions": next((str(p.relative_to(out_dir)) for p in sorted(media_dir.glob("audio*.vtt"))), None),
         }
     else:
         path = Path(inp).expanduser().resolve()
@@ -109,7 +118,7 @@ def resolve_source(inp: str, out_root: Path, slug_override: str | None, force: b
         out_dir.mkdir(parents=True, exist_ok=True)
         media = path
         source = {"title": title, "url": None, "path": str(path), "duration": probe_duration(path),
-                  "site": None, "id": None, "uploader": None, "upload_date": None}
+                  "site": None, "id": None, "uploader": None, "upload_date": None, "chapters": [], "captions": None}
     return source, media, out_dir
 
 
@@ -378,6 +387,43 @@ def sections(sents: list[dict], target: float, lo: float, hi: float) -> list[lis
     return out
 
 
+def sections_from_chapters(sents: list[dict], chapters: list[dict], target: float, lo: float, hi: float) -> list[list[dict]]:
+    """Cut at the creator's chapter marks, snapped to the nearest sentence boundary. Chapters shorter
+    than 30 s merge forward; chapters longer than 1.5x the max are split by the pause rule."""
+    marks = sorted(c["start"] for c in chapters if c["start"] > 0)
+    titles = {c["start"]: c.get("title") for c in chapters}
+    bounds: list[int] = []  # sentence index where a new section starts
+    for m in marks:
+        i = min(range(len(sents)), key=lambda k: abs(sents[k]["start"] - m))
+        if i and (not bounds or i > bounds[-1]):
+            bounds.append(i)
+    groups: list[list[dict]] = []
+    prev = 0
+    for b in bounds + [len(sents)]:
+        if b > prev:
+            groups.append(sents[prev:b]); prev = b
+    merged: list[list[dict]] = []
+    for g in groups:
+        if merged and (merged[-1][-1]["end"] - merged[-1][0]["start"]) < 30:
+            merged[-1].extend(g)
+        else:
+            merged.append(g)
+    out: list[list[dict]] = []
+    for g in merged:
+        if g[-1]["end"] - g[0]["start"] > hi * 1.5:
+            out.extend(sections(g, target, lo, hi))
+        else:
+            out.append(g)
+    # attach the chapter title to the section that starts nearest its mark
+    for sec in out:
+        near = min(marks + [0.0], key=lambda m: abs(sec[0]["start"] - m)) if marks else 0.0
+        sec_title = titles.get(near) if abs(sec[0]["start"] - near) < 20 else None
+        sec[0]["chapter"] = sec_title
+    if out and out[0][0].get("chapter") is None and chapters and chapters[0]["start"] == 0:
+        out[0][0]["chapter"] = chapters[0].get("title")
+    return out
+
+
 def paragraphs(sents: list[dict], min_len: float = 20.0, max_len: float = 75.0, gap: float = 1.2) -> list[list[dict]]:
     paras: list[list[dict]] = []
     cur: list[dict] = []
@@ -401,6 +447,7 @@ def write_outputs(out_dir: Path, source: dict, words: list[dict], secs: list[lis
             "index": k, "start": round(sec[0]["start"], 2), "end": round(sec[-1]["end"], 2),
             "start_hms": hms(sec[0]["start"], hours), "end_hms": hms(sec[-1]["end"], hours),
             "text": " ".join(s["text"] for s in sec), "word_count": sum(s["n"] for s in sec),
+            "title": sec[0].get("chapter"),
         })
 
     with (out_dir / "chunks.jsonl").open("w") as f:
@@ -419,7 +466,7 @@ def write_outputs(out_dir: Path, source: dict, words: list[dict], secs: list[lis
         lines.append(f"Source: {source['url']}  ")
     lines += [" · ".join(meta), ""]
     for r, sec in zip(sec_records, secs):
-        lines += [f"## {r['index']}. [{r['start_hms']}–{r['end_hms']}]", ""]
+        lines += [f"## {r['index']}. [{r['start_hms']}–{r['end_hms']}]" + (f" {r['title']}" if r.get("title") else ""), ""]
         for para in paragraphs(sec):
             lines += [f"[{hms(para[0]['start'], hours)}] " + " ".join(s["text"] for s in para), ""]
     (out_dir / "transcript.md").write_text("\n".join(lines).rstrip() + "\n")
@@ -441,6 +488,9 @@ def main() -> None:
     ap.add_argument("--section-min", type=float, default=90)
     ap.add_argument("--section-max", type=float, default=300)
     ap.add_argument("--force", action="store_true", help="redo download, wav and whisper even if cached")
+    ap.add_argument("--playlist", action="store_true", help="a playlist or channel URL: transcribe every entry")
+    ap.add_argument("--video", action="store_true", help="keep the video too (720p) so render can grab frames")
+    ap.add_argument("--no-chapters", action="store_true", help="ignore the creator's chapter marks")
     ap.add_argument("--quiet", action="store_true")
     a = ap.parse_args()
     if a.quiet:
@@ -453,7 +503,19 @@ def main() -> None:
 
     timer = Timer()
     log(f"transcribe: {a.input}")
-    source, media, out_dir = resolve_source(a.input, Path(a.out).expanduser(), a.slug, a.force, timer)
+    source, media, out_dir = resolve_source(a.input, Path(a.out).expanduser(), a.slug, a.force, timer,
+                                            playlist_ok=a.playlist, video=a.video)
+    if media is None:  # a playlist: run each entry as its own transcribe so one failure doesn't stop the rest
+        entries = [e for e in source.get("entries") or [] if e and (e.get("url") or e.get("webpage_url"))]
+        log(f"  playlist \"{source.get('title')}\": {len(entries)} entries")
+        passthrough = [x for x in sys.argv[1:] if x not in (a.input, "--playlist")]
+        failed = 0
+        for i, e in enumerate(entries, 1):
+            url = e.get("webpage_url") or e["url"]
+            log(f"\n[{i}/{len(entries)}] {e.get('title') or url}")
+            r = subprocess.run([sys.executable, __file__, url] + [x for x in passthrough if x != a.slug])
+            failed += r.returncode != 0
+        sys.exit(1 if failed else 0)
     log(f"  → {out_dir}")
     wav = out_dir / "audio.wav"
     to_wav(media, wav, a.force, timer)
@@ -477,7 +539,10 @@ def main() -> None:
                 break
         words = tidy(words)
         sents = sentences(words)
-        secs = sections(sents, a.section_target, a.section_min, a.section_max)
+        if len(source.get("chapters") or []) >= 2 and not a.no_chapters:
+            secs = sections_from_chapters(sents, source["chapters"], a.section_target, a.section_min, a.section_max)
+        else:
+            secs = sections(sents, a.section_target, a.section_min, a.section_max)
         low = [{"word": w["word"], "at": hms(w["start"], source["duration"] >= 3600), "p": round(w["p"], 2)}
                for w in words if w["p"] < LOW_P]
         return words, secs, {"words_raw": n_raw, "fillers_removed": n_fill, "stutter_words_removed": n_stut,
