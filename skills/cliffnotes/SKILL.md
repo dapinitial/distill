@@ -184,8 +184,11 @@ line, then run `library`. Report the links.
 
 `library` also writes `out/toc.html` and `out/library.json`. If `out/toc.artifact.json` exists,
 republish `toc.html` to that `url` (with `files: {"library.json": "out/library.json"}`) so the
-published table of contents lists the new pages; otherwise publish it once (icon "library") and
-write `out/toc.artifact.json`. Report that link too.
+published table of contents lists the new pages; otherwise publish it once (icon "library",
+`capabilities: {"db": {}, "user": {}}`, which the page uses to keep reading progress) and write
+`out/toc.artifact.json`. Report that link too. Pages rendered after `toc.artifact.json` exists carry
+"Save progress" and "Mark as read" links back to it, so render and publish the table of contents
+before the pages when both are new.
 
 ## 6. Show the notes
 

@@ -15,6 +15,7 @@ import argparse
 import base64
 import html
 import json
+import os
 import re
 import subprocess
 import sys
@@ -239,11 +240,22 @@ button:focus-visible, a:focus-visible, input:focus-visible { outline: 2px solid 
 mark { background: var(--mark); color: inherit; border-radius: 2px; padding: 0 1px }
 .toast { position: fixed; left: 50%; bottom: calc(24px + env(safe-area-inset-bottom, 0px)); transform: translateX(-50%); background: var(--fg); color: var(--bg); padding: 8px 14px; border-radius: 6px; font-size: .9rem; opacity: 0; transition: opacity .2s; pointer-events: none }
 .toast.show { opacity: 1 }
+/* Reading progress: a ring at bottom right whose stroke tracks how far down the page you are; click for the top. */
+.ring { position: fixed; right: calc(10px + env(safe-area-inset-right, 0px)); bottom: calc(10px + env(safe-area-inset-bottom, 0px)); width: 40px; height: 40px; border-radius: 50%; border: 0; padding: 0;
+  background: var(--panel); box-shadow: 0 3px 8px rgba(0, 0, 0, .28); cursor: pointer; display: grid; place-items: center; z-index: 5;
+  opacity: 0; transform: translateY(100px); transition: transform .3s ease-in-out, opacity .3s ease-in-out; will-change: transform }
+.ring.visible { opacity: 1; transform: translateY(0) }
+.ring svg.circle { position: absolute; inset: 0; width: 100%; height: 100% }
+.ring svg.circle path { fill: none; stroke-width: 4; stroke-linecap: round } .ring .track { stroke: var(--line) } .ring .bar { stroke: var(--accent); transition: stroke-dashoffset 10ms linear }
+.ring .arrow { width: 14px; height: 14px; color: var(--muted); transition: transform .2s linear; position: relative } .ring:hover .arrow { transform: rotate(180deg) }
+.end { margin: 24px 0 8px; padding: 14px 12px; border-top: 1px solid var(--line); color: var(--muted); font-size: .9rem; display: flex; flex-wrap: wrap; gap: 6px 18px; align-items: baseline }
+.library { font-size: .85rem } .notes .library { display: block; margin-top: 4px }
+#resume { display: none } #resume.show { display: inline-block }
 @media (max-width: 900px) {
   .wrap { grid-template-columns: 1fr; gap: 0 }
   .notes { position: static; max-height: none; border-bottom: 1px solid var(--line) }
 }
-@media (prefers-reduced-motion: reduce) { .toast { transition: none } }
+@media (prefers-reduced-motion: reduce) { .toast, .ring, .ring .arrow, .ring .bar { transition: none } }
 </style>
 """
 
@@ -325,6 +337,31 @@ JS = r"""
     copy('> "' + text + '"' + where + '\n\nFrom ' + SRC.title + ' (' + SRC.folder + ')\n\nQuestion: ', 'Copied with timestamp. Paste into Claude Code.');
   });
   var cn = document.getElementById('copy-notes'); if (cn) cn.addEventListener('click', function () { copy(SRC.notes, 'Cliff notes copied as markdown'); });
+
+  // Reading progress: the ring tracks the page scroll; the furthest point is remembered in this browser
+  // (resume chip), and the library links carry it over as a hash the library page records.
+  var ring = document.getElementById('ring'), bar = ring && ring.querySelector('.bar'), plen = bar ? bar.getTotalLength() : 0;
+  if (bar) { bar.style.strokeDasharray = plen + ' ' + plen; bar.style.strokeDashoffset = plen; }
+  var KEY = 'distill:progress:' + (SRC.slug || ''), best = 0, pct = 0;
+  try { best = Math.min(100, +localStorage.getItem(KEY) || 0); } catch (_) {}
+  var save = document.getElementById('save-progress'), resume = document.getElementById('resume');
+  function pageHeight() { return document.documentElement.scrollHeight - window.innerHeight; }
+  function links() {
+    if (!save || !SRC.toc) return;
+    save.href = SRC.toc + '#at-' + SRC.slug + '-' + best;
+    save.textContent = 'Save progress to the library (' + best + '%) ↗';
+  }
+  function onScroll() {
+    var h = pageHeight(); pct = h > 0 ? Math.max(0, Math.min(100, Math.round(window.scrollY / h * 100))) : 100;
+    if (ring) { var shown = window.scrollY > 50; ring.classList.toggle('visible', shown); ring.tabIndex = shown ? 0 : -1;
+      bar.style.strokeDashoffset = plen - plen * pct / 100; ring.title = pct + '% read'; ring.setAttribute('aria-label', pct + '% read. Back to top'); }
+    if (pct > best) { best = pct; try { localStorage.setItem(KEY, String(best)); } catch (_) {} links(); }
+  }
+  window.addEventListener('scroll', onScroll, {passive: true});
+  if (ring) ring.addEventListener('click', function () { window.scrollTo({top: 0, behavior: 'smooth'}); });
+  if (resume && best >= 5 && best < 95) { resume.textContent = 'Resume at ' + best + '%'; resume.classList.add('show');
+    resume.addEventListener('click', function () { window.scrollTo({top: pageHeight() * best / 100, behavior: 'smooth'}); resume.classList.remove('show'); }); }
+  links(); onScroll();
 })();
 </script>
 """
@@ -394,7 +431,29 @@ def main() -> None:
             player_html = f'<div class="player"><audio id="audio" controls preload="metadata" src="{esc(src_file.relative_to(folder).as_posix())}"></audio></div>'
     follow_html = '<label><input type="checkbox" id="follow" checked> Follow playback</label>' if player_html else ""
 
-    payload = json.dumps({"title": title, "url": url_base, "folder": str(folder), "notes": notes_md}, ensure_ascii=False)
+    # The published library page records reading progress; its URL is kept beside the folders once it is published.
+    toc_url = None
+    for cand in (folder.parent / "toc.artifact.json", Path(os.environ.get("DISTILL_OUT", folder.parent)) / "toc.artifact.json"):
+        if cand.exists():
+            try:
+                toc_url = json.loads(cand.read_text()).get("url")
+                break
+            except (OSError, ValueError):
+                pass
+    slug = folder.name
+    lib_links = ""
+    if toc_url:
+        lib_links = (f'<a class="library" id="save-progress" href="{esc(toc_url)}#at-{esc(slug)}-0" target="_blank" rel="noopener">Save progress to the library (0%) ↗</a>')
+        mark_read = f'<a class="library" href="{esc(toc_url)}#read-{esc(slug)}" target="_blank" rel="noopener">Mark as read in the library ↗</a>'
+    else:
+        mark_read = ""
+    end_html = f'<footer class="end"><span>End of the transcript.</span>{mark_read}</footer>'
+    ring_html = ('<button class="ring" id="ring" type="button" tabindex="-1" aria-label="Back to top">'
+                 '<svg class="circle" viewBox="-1 -1 102 102" aria-hidden="true"><path class="track" d="M50,1 a49,49 0 0,1 0,98 a49,49 0 0,1 0,-98"/>'
+                 '<path class="bar" d="M50,1 a49,49 0 0,1 0,98 a49,49 0 0,1 0,-98"/></svg>'
+                 '<svg class="arrow" viewBox="0 0 16 16" aria-hidden="true"><path d="M8 2v11M3.5 8.5 8 13l4.5-4.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg></button>')
+
+    payload = json.dumps({"title": title, "url": url_base, "folder": str(folder), "slug": slug, "toc": toc_url, "notes": notes_md}, ensure_ascii=False)
     payload = payload.replace("</", "<\\/")
     page = f"""<title>{esc(title)}</title>
 <meta name="claude:viewport-fit-sides" content="cover">
@@ -409,17 +468,21 @@ def main() -> None:
   <aside class="notes" id="notes">
     {notes_html}
     {'<p><button id="copy-notes">Copy notes as markdown</button></p>' if notes_md else ''}
+    {lib_links}
   </aside>
   <main class="transcript">
     <div class="toolbar">
       <input type="search" id="q" placeholder="Search the transcript" aria-label="Search the transcript">
       <span class="count" id="count"></span>
       {follow_html}
+      <button id="resume" type="button">Resume</button>
       <button class="primary" id="copy-sel" title="Copy the selected text as a quote with its timestamp, ready to paste into Claude Code">Copy selection for Claude</button>
     </div>
     {t_html}
+    {end_html}
   </main>
 </div>
+{ring_html}
 <div class="toast" id="toast" role="status" aria-live="polite"></div>
 <script>window.DISTILL = {payload};</script>
 {JS}
