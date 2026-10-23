@@ -179,6 +179,22 @@ def transcript_html(md: str, url_base: str | None, hours: bool, frames: dict[int
     return "\n".join(out), paras
 
 
+def jump_html(md: str) -> str:
+    """The section jump list: a dropdown in the sticky toolbar showing the current section."""
+    secs = [m.groups() for m in re.finditer(rf"^## (\d+)\. \[({TS})[-–]({TS})\]\s*(.*)$", md, re.M)]
+    if len(secs) < 2:
+        return ""
+    items = []
+    for n, a, _b, ttl in secs:
+        label = esc(ttl.strip()) or f"Section {n}"
+        items.append(f'<li><a href="#s-{n}" data-s="{n}"><span class="jn">{n}</span><span class="jl">{label}</span>'
+                     f'<span class="jt">{esc(a)}</span></a></li>')
+    n0, a0, _, t0 = secs[0]
+    return (f'<details class="jump" id="jump"><summary title="Jump to a section">'
+            f'<span class="jn" id="jump-n">{n0}</span><span class="jl" id="jump-l">{esc(t0.strip()) or "Section " + n0}</span>'
+            f'<span class="jt">of {len(secs)}</span></summary><ol>{"".join(items)}</ol></details>')
+
+
 CSS = """
 <style>
 /* Layout: a reading desk. Notes in a sticky rail on the left, the transcript as the long scroll on the right,
@@ -223,7 +239,24 @@ button.primary { background: var(--accent); color: var(--accent-ink); border-col
 button:focus-visible, a:focus-visible, input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px }
 .count { font-size: .85rem; color: var(--muted); font-variant-numeric: tabular-nums }
 .transcript { min-width: 0 }
-.transcript section { padding-block: 14px 6px }
+.transcript section { padding-block: 14px 6px; scroll-margin-top: 72px }
+/* Section jump list: lives in the sticky toolbar, names the section in view, opens into every section. */
+.jump { position: relative; flex: 0 1 auto; min-width: 0; max-width: 100% }
+.jump summary { list-style: none; cursor: pointer; display: flex; align-items: center; gap: 8px; font-size: .85rem; padding: 6px 10px;
+  border: 1px solid var(--line); border-radius: 6px; background: var(--panel); max-width: 22rem; min-width: 0 }
+.jump summary::-webkit-details-marker { display: none }
+.jump summary::after { content: ""; width: 6px; height: 6px; border-right: 1.5px solid var(--muted); border-bottom: 1.5px solid var(--muted); transform: rotate(45deg) translateY(-2px); flex: none }
+.jump[open] summary::after { transform: rotate(-135deg) translateY(-1px) }
+.jump summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px }
+.jump .jl { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0 }
+.jump .jn { font: 600 .72rem/1 var(--mono); color: var(--accent); border: 1px solid var(--accent); border-radius: 4px; padding: 3px 5px; flex: none }
+.jump .jt { font: .78rem var(--mono); color: var(--muted); flex: none; font-variant-numeric: tabular-nums }
+.jump ol { position: absolute; left: 0; top: calc(100% + 6px); z-index: 4; list-style: none; margin: 0; padding: 6px; width: min(26rem, calc(100vw - 32px));
+  max-height: min(60vh, 28rem); overflow: auto; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; box-shadow: 0 8px 24px rgba(0, 0, 0, .18) }
+.jump li a { display: flex; align-items: baseline; gap: 10px; padding: 7px 8px; border-radius: 5px; color: var(--fg); text-decoration: none; font-size: .9rem }
+.jump li a:hover, .jump li a:focus-visible { background: var(--bg); outline: none }
+.jump li a[aria-current="true"] { background: var(--now) }
+.jump li .jl { flex: 1 1 auto; white-space: normal }
 .transcript h3 { font: 500 .95rem/1.3 var(--body); margin: 10px 0 4px; display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; color: var(--muted) }
 .transcript h3 .n { font: 600 .75rem/1 var(--mono); color: var(--accent); border: 1px solid var(--accent); border-radius: 4px; padding: 3px 5px }
 .transcript h3 .ttl { color: var(--fg); font-weight: 600 }
@@ -362,6 +395,33 @@ JS = r"""
   if (resume && best >= 5 && best < 95) { resume.textContent = 'Resume at ' + best + '%'; resume.classList.add('show');
     resume.addEventListener('click', function () { window.scrollTo({top: pageHeight() * best / 100, behavior: 'smooth'}); resume.classList.remove('show'); }); }
   links(); onScroll();
+
+  // Section jump list: name the section in view, jump on click, close on pick / Escape / outside click.
+  var jump = document.getElementById('jump');
+  if (jump) {
+    var secs = Array.prototype.slice.call(document.querySelectorAll('.transcript section'));
+    var jlinks = Array.prototype.slice.call(jump.querySelectorAll('ol a'));
+    var jn = document.getElementById('jump-n'), jl = document.getElementById('jump-l');
+    var bar = document.querySelector('.toolbar'), cur = -1, pending = false;
+    function current() {
+      var edge = (bar ? bar.getBoundingClientRect().bottom : 0) + 12, i = 0;
+      for (var k = 0; k < secs.length; k++) { if (!secs[k].hidden && secs[k].getBoundingClientRect().top <= edge) i = k; }
+      if (i === cur) return; cur = i;
+      jlinks.forEach(function (a, k) { if (k === i) a.setAttribute('aria-current', 'true'); else a.removeAttribute('aria-current'); });
+      var a = jlinks[i]; if (!a) return;
+      jn.textContent = a.querySelector('.jn').textContent; jl.textContent = a.querySelector('.jl').textContent;
+    }
+    window.addEventListener('scroll', function () { if (pending) return; pending = true; requestAnimationFrame(function () { pending = false; current(); }); }, {passive: true});
+    jump.addEventListener('click', function (e) {
+      var a = e.target.closest && e.target.closest('ol a'); if (!a) return;
+      e.preventDefault(); jump.open = false;
+      var s = document.getElementById('s-' + a.dataset.s); if (s) s.scrollIntoView({block: 'start', behavior: 'smooth'});
+    });
+    jump.addEventListener('toggle', function () { if (jump.open) { var a = jlinks[cur]; if (a) a.scrollIntoView({block: 'nearest'}); } });
+    document.addEventListener('keydown', function (e) { if (e.key === 'Escape' && jump.open) { jump.open = false; jump.querySelector('summary').focus(); } });
+    document.addEventListener('click', function (e) { if (jump.open && !jump.contains(e.target)) jump.open = false; });
+    current();
+  }
 })();
 </script>
 """
@@ -472,6 +532,7 @@ def main() -> None:
   </aside>
   <main class="transcript">
     <div class="toolbar">
+      {jump_html(transcript_md)}
       <input type="search" id="q" placeholder="Search the transcript" aria-label="Search the transcript">
       <span class="count" id="count"></span>
       {follow_html}
