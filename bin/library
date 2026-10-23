@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """library: index every transcript folder under $DISTILL_OUT.
 
-  library [--out DIR] [--open]
+  library [--out DIR] [--open] [--serve [PORT]]
 
 Writes <out>/index.md (for agents) and <out>/index.html (for people): title, date, duration,
-the point from the cliff notes, and links to the folder, the page and the source.
+the point from the cliff notes, and links to the folder, the page and the source. Also writes
+<out>/library.json (the same entries, for fetching) and <out>/toc.html (a compact table of contents
+that links only to published pages and sources; publish it as an Artifact with library.json beside it).
+--serve puts the folder on localhost with CORS open so any page can iframe toc.html or fetch library.json.
 """
 from __future__ import annotations
 
@@ -102,16 +105,133 @@ article p {{ margin: 0 0 10px; font-size: .95rem }} .links a {{ color: var(--acc
     (root / "index.html").write_text(page)
 
 
+def write_json(root: Path, items: list[dict]) -> None:
+    """library.json: the same entries for anything that fetches rather than reads."""
+    keys = ("slug", "title", "uploader", "url", "artifact", "created", "duration", "words", "point")
+    doc = {"generated": __import__("datetime").date.today().isoformat(), "count": len(items),
+           "entries": [{k: e[k] for k in keys} for e in items]}
+    (root / "library.json").write_text(json.dumps(doc, ensure_ascii=False, indent=1) + "\n")
+
+
+def write_toc(root: Path, items: list[dict]) -> None:
+    """toc.html: a compact table of contents meant to be published as its own Artifact.
+
+    Links only to things that resolve from anywhere (the published pages and the sources), never to
+    local files. Narrow-friendly so it also works inside an iframe or a sidebar. library.json is
+    published beside it for anything that would rather fetch than read.
+    """
+    esc = lambda s: html.escape(str(s), quote=True)  # noqa: E731
+    rows = []
+    for e in items:
+        title = f'<a href="{esc(e["artifact"])}" target="_blank" rel="noopener">{esc(e["title"])}</a>' if e["artifact"] else esc(e["title"])
+        meta = [hms(e["duration"]), f"{e['words']:,} words", e["created"]]
+        if e["uploader"]:
+            meta.insert(0, esc(e["uploader"]))
+        links = []
+        if e["artifact"]:
+            links.append(f'<a href="{esc(e["artifact"])}" target="_blank" rel="noopener">notes + transcript</a>')
+        if e["url"]:
+            links.append(f'<a href="{esc(e["url"])}" target="_blank" rel="noopener">source</a>')
+        state = "" if e["artifact"] else ' <span class="tag">not published</span>'
+        point = esc(e["point"]) if e["point"] else '<em>No cliff notes yet.</em>'
+        rows.append(f'''<li data-q="{esc((e["title"] + " " + (e["uploader"] or "") + " " + e["point"]).lower())}">
+  <h2>{title}{state}</h2>
+  <div class="meta">{" · ".join(meta)}</div>
+  <p>{point}</p>
+  <div class="links">{" · ".join(links)}</div>
+</li>''')
+    total = sum(e["duration"] for e in items)
+    page = f"""<title>distill library</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Serif:wght@600&family=IBM+Plex+Mono:wght@400&display=swap">
+<style>
+/* Layout: one narrow column, a table of contents that reads the same at 360px in an iframe as on a desktop tab. */
+:root {{ --bg:#f5f6f8; --panel:#ffffff; --fg:#1c2029; --muted:#6a7282; --line:#dfe3ea; --accent:#0d6b70;
+  --display:"IBM Plex Serif", Georgia, serif; --body:"IBM Plex Sans", -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; --mono:"IBM Plex Mono", ui-monospace, Menlo, monospace }}
+@media (prefers-color-scheme: dark) {{ :root:not([data-theme="light"]) {{ --bg:#13161d; --panel:#1b1f28; --fg:#e4e7ee; --muted:#949caf; --line:#2b313d; --accent:#5cc8cc; color-scheme: dark }} }}
+:root[data-theme="dark"] {{ --bg:#13161d; --panel:#1b1f28; --fg:#e4e7ee; --muted:#949caf; --line:#2b313d; --accent:#5cc8cc; color-scheme: dark }}
+*, *::before, *::after {{ box-sizing: border-box }}
+body {{ margin:0; background:var(--bg); color:var(--fg); font:15px/1.5 var(--body); padding-block: 0 40px;
+  padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)) }}
+a {{ color: var(--accent) }}
+.wrap {{ max-width: 720px; margin: 0 auto }}
+header {{ padding-block: 20px 12px; border-bottom: 1px solid var(--line); display:flex; flex-wrap:wrap; gap: 6px 16px; align-items: baseline }}
+h1 {{ font: 600 1.25rem/1.2 var(--display); margin: 0 }}
+.sub {{ color: var(--muted); font-size: .85rem; font-variant-numeric: tabular-nums }}
+.tools {{ display:flex; gap:8px; align-items:center; padding-block: 12px; position: sticky; top: env(safe-area-inset-top, 0px); background: var(--bg); z-index: 2 }}
+input[type=search] {{ flex:1 1 160px; min-width:0; font: inherit; padding: 6px 10px; border:1px solid var(--line); border-radius:6px; background:var(--panel); color:var(--fg) }}
+input:focus-visible, a:focus-visible {{ outline: 2px solid var(--accent); outline-offset: 2px }}
+.count {{ color: var(--muted); font-size: .85rem; font-variant-numeric: tabular-nums; white-space: nowrap }}
+ol {{ list-style: none; margin: 0; padding: 0; display: grid; gap: 0 }}
+li {{ padding-block: 14px; border-bottom: 1px solid var(--line); min-width: 0 }}
+li h2 {{ font: 600 1rem/1.3 var(--body); margin: 0 0 2px; text-wrap: balance }}
+li h2 a {{ color: inherit; text-decoration: none }} li h2 a:hover {{ color: var(--accent); text-decoration: underline }}
+.meta {{ color: var(--muted); font-size: .8rem; font-family: var(--mono); margin-bottom: 6px }}
+li p {{ margin: 0 0 6px; max-width: 65ch; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden }}
+li:target p, li.open p {{ display: block }}
+.links {{ font-size: .85rem }} .links a {{ margin-right: 2px }}
+.tag {{ font: 500 .7rem/1 var(--body); letter-spacing: .06em; text-transform: uppercase; color: var(--muted); border: 1px solid var(--line); border-radius: 4px; padding: 3px 5px; vertical-align: middle; margin-left: 6px }}
+footer {{ color: var(--muted); font-size: .8rem; padding-top: 16px }} footer code {{ font-family: var(--mono) }}
+</style>
+<div class="wrap">
+<header><h1>distill library</h1><span class="sub">{len(items)} talks · {hms(total)} of video · updated {esc(__import__("datetime").date.today().isoformat())}</span></header>
+<div class="tools"><input type="search" id="q" placeholder="Filter by title, speaker or topic" aria-label="Filter the library"><span class="count" id="count"></span></div>
+<ol id="list">{''.join(rows)}</ol>
+<footer>Each entry opens the published page: cliff notes beside the full transcript, every timestamp a link into the video. Machine-readable copy: <a href="library.json">library.json</a> next to this page. Transcribed locally with whisper.cpp; nothing but these pages leaves the machine.</footer>
+</div>
+<script>
+(function () {{
+  var q = document.getElementById('q'), items = Array.prototype.slice.call(document.querySelectorAll('#list li')), count = document.getElementById('count');
+  function filter() {{ var v = q.value.trim().toLowerCase(), n = 0; items.forEach(function (li) {{ var hit = !v || li.dataset.q.indexOf(v) >= 0; li.hidden = !hit; if (hit) n++; }}); count.textContent = v ? n + ' of ' + items.length : items.length + ' talks'; }}
+  q.addEventListener('input', filter); filter();
+  document.getElementById('list').addEventListener('click', function (e) {{ if (e.target.tagName === 'P') e.target.parentElement.classList.toggle('open'); }});
+}})();
+</script>
+"""
+    (root / "toc.html").write_text(page)
+
+
+def serve(root: Path, port: int) -> None:
+    """Serve the library folder on localhost with CORS open, so any page can iframe toc.html or
+    fetch library.json. Private Artifacts cannot be embedded or fetched from outside claude.ai; this is
+    the local equivalent. Nothing leaves the machine."""
+    import http.server
+    import functools
+
+    class H(http.server.SimpleHTTPRequestHandler):
+        def end_headers(self):
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Cache-Control", "no-store")
+            super().end_headers()
+
+        def log_message(self, fmt, *args):  # quiet
+            pass
+
+    handler = functools.partial(H, directory=str(root))
+    with http.server.ThreadingHTTPServer(("127.0.0.1", port), handler) as srv:
+        print(f"serving {root} at http://localhost:{port}/toc.html and /library.json (ctrl-c to stop)")
+        try:
+            srv.serve_forever()
+        except KeyboardInterrupt:
+            pass
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--out", default=os.environ.get("DISTILL_OUT", str(HOME / "out")))
     ap.add_argument("--open", action="store_true")
+    ap.add_argument("--serve", nargs="?", const=8765, type=int, metavar="PORT",
+                    help="after writing, serve the folder on localhost (default port 8765) with CORS open")
     a = ap.parse_args()
     root = Path(a.out).expanduser()
     items = entries(root)
     write_md(root, items)
     write_html(root, items)
-    print(f"{root / 'index.md'}\n{root / 'index.html'}  ({len(items)} transcripts)")
+    write_json(root, items)
+    write_toc(root, items)
+    print(f"{root / 'index.md'}\n{root / 'index.html'}\n{root / 'library.json'}\n{root / 'toc.html'}  ({len(items)} transcripts)")
+    if a.serve:
+        serve(root, a.serve)
     if a.open:
         subprocess.run(["open", str(root / "index.html")])
 

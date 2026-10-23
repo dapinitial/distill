@@ -42,8 +42,15 @@ captions-md out/<slug> --write                       # YouTube's English caption
 glossary-suggest out/<slug>                          # names Whisper likely misheard, as glossary lines
 render out/<slug> --open                             # the page, with an embedded player
 library --open                                       # index of everything under out/
+library --serve                                      # toc.html + library.json on localhost, CORS open
 where --all "phrase"                                 # which talks said it, and when
 ```
+
+The library also comes as a table of contents meant for sharing: `out/toc.html` links only to the
+published pages and the sources, and `out/library.json` is the same list for anything that fetches.
+Publish `toc.html` as an Artifact with `library.json` beside it and you have one link for the whole
+library. Private Artifacts cannot be embedded in an iframe or fetched from another site, so for a
+page that needs to load the list itself, use `library --serve` (local) or host the two files anywhere.
 
 Or in Claude Code: `/transcribe <link>` then `/cliffnotes <folder>`, or just `/cliffnotes <link>`.
 
@@ -81,7 +88,7 @@ Each transcript folder holds:
 | `where` | find when a phrase was said, printed as a timestamp link |
 | `stamp` | turn `7:49` or `469` into the `[07:49](…&t=469)` marker |
 | `render` | one self-contained HTML page per transcript: notes beside the transcript, search, timestamp links, frame grabs when the video is present. `--open` adds an embedded player (YouTube or the local audio) that seeks from any timestamp and highlights the paragraph being spoken |
-| `library` | `out/index.md` and `out/index.html`: every transcript with its date, length, the point, and links |
+| `library` | `out/index.md` and `out/index.html` (every transcript with its date, length, the point, and links), plus `toc.html` and `library.json` for publishing and fetching; `--serve` puts them on localhost |
 | `glossary-suggest` | three deterministic signals for misheard names: spelling clusters, disagreements with YouTube's captions, low-confidence words |
 | `captions-md` | a captions track as timestamped markdown; the no-model way to read a foreign-language talk in English |
 | `distill-batch` | queue runner for unattended transcribe → cliffnotes → verify → library |

@@ -182,6 +182,11 @@ empty while doing other distill work), for each folder: publish `index.html` wit
 (or republish with its `url` if `artifact.json` already exists), write `artifact.json`, remove the
 line, then run `library`. Report the links.
 
+`library` also writes `out/toc.html` and `out/library.json`. If `out/toc.artifact.json` exists,
+republish `toc.html` to that `url` (with `files: {"library.json": "out/library.json"}`) so the
+published table of contents lists the new pages; otherwise publish it once (icon "library") and
+write `out/toc.artifact.json`. Report that link too.
+
 ## 6. Show the notes
 
 Unattended runs: `distill-batch` calls this skill headlessly for each queued item and checks the
