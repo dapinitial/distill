@@ -246,7 +246,10 @@ def main() -> None:
     try:
         srv = http.server.ThreadingHTTPServer((host, a.port), handler)
     except OSError as e:
-        sys.exit(f"distill-web: cannot bind {host}:{a.port}: {e}" + (" (is Tailscale on?)" if a.tailscale else ""))
+        if e.errno == 48:  # EADDRINUSE
+            sys.exit(f"distill-web: something already listens on {host}:{a.port}, probably an earlier distill-web. "
+                     f"Open http://{host}:{a.port}/ or stop it with: pkill -f distill-web")
+        sys.exit(f"distill-web: cannot bind {host}:{a.port}: {e}" + (" (is Tailscale on? it takes a few seconds to come up)" if a.tailscale else ""))
     print(f"distill-web at http://{host}:{a.port}/  (ctrl-c to stop)")
     try:
         srv.serve_forever()
