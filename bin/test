@@ -156,5 +156,30 @@ with tempfile.TemporaryDirectory() as d:
     check("verify-quotes: 2 ok, 4 fails (paraphrase, [02:00] and t=120 past the end, mismatch), exit 1",
           (sum(l.startswith("OK") for l in lines), sum(l.startswith("FAIL") for l in lines), r.returncode), (2, 4, 1))
 
+# --- ask: ranking across a small library -----------------------------------------------------
+with tempfile.TemporaryDirectory() as tmp:
+    root = Path(tmp)
+    def talk(slug: str, sections: list[str]) -> None:
+        f = root / slug; f.mkdir()
+        (f / "source.json").write_text(json.dumps({"title": slug, "url": "https://www.youtube.com/watch?v=abcdefghijk", "duration": 600}))
+        words, lines, t = [], [], 0.0
+        for i, text_ in enumerate(sections, 1):
+            start = t
+            for w_ in text_.split():
+                words.append({"word": w_, "start": round(t, 2), "end": round(t + 0.4, 2), "p": 0.9}); t += 0.5
+            lines.append(json.dumps({"index": i, "start": start, "end": t, "start_hms": hms(start), "end_hms": hms(t),
+                                     "text": text_, "word_count": len(text_.split()), "title": f"s{i}"}))
+        (f / "chunks.jsonl").write_text("\n".join(lines) + "\n")
+        (f / "transcript.json").write_text(json.dumps({"words": words}))
+    talk("drains", ["We talk about mushrooms and tents today.", "The floor drains cost eight grand and took a week of jackhammering."])
+    talk("floors", ["Carpet on the floor harbors mold.", "The drain in the sink is slow, and the floor is wet."])
+    talk("other", ["Nothing about that topic here at all."])
+    env = dict(os.environ, DISTILL_OUT=str(root))
+    r = subprocess.run([sys.executable, str(HERE / "ask"), "floor drain", "--json"], capture_output=True, text=True, env=env)
+    got = json.loads(r.stdout)["results"]
+    check("ask: the section with the phrase ranks first, plural matched, timestamp 2 s before the first hit clamped to the section start",
+          (got[0]["slug"], got[0]["section"], got[0]["start"]), ("drains", 2, 3.5))
+    check("ask: a talk without the words is not listed", "other" in {x["slug"] for x in got}, False)
+
 print(f"\n{'all passed' if not FAILS else f'{FAILS} failed'}")
 sys.exit(1 if FAILS else 0)

@@ -86,6 +86,8 @@ Each transcript folder holds:
 | `transcribe` | the whole pipeline: yt-dlp → ffmpeg → whisper-cli → cleanup → sections → files. Caches every step; reruns take seconds |
 | `verify-quotes` | proves every quoted span in `cliffnotes.md` is verbatim and every timestamp is inside the video; exit 1 on any failure, with a hint on how to fix each |
 | `where` | find when a phrase was said, printed as a timestamp link |
+| `ask` | which talks say something about a question, ranked across the library (BM25 over the sections, no model), as markdown with timestamp links ready for Claude Code |
+| `distill-web` | a small server on the Mac: paste a link, it is queued and distilled, read the library; reach it from a phone over Tailscale |
 | `stamp` | turn `7:49` or `469` into the `[07:49](…&t=469)` marker |
 | `render` | one self-contained HTML page per transcript: notes beside the transcript, search, timestamp links, frame grabs when the video is present. `--open` adds an embedded player (YouTube or the local audio) that seeks from any timestamp and highlights the paragraph being spoken |
 | `library` | `out/index.md` and `out/index.html` (every transcript with its date, length, the point, and links), plus `toc.html` and `library.json` for publishing and fetching; `--serve` puts them on localhost |
@@ -127,6 +129,39 @@ transcribe meeting.m4a --speakers    # or --speakers 3 when you know the count
 ```
 
 Speakers are detected locally (pyannote segmentation + TitaNet embeddings via sherpa-onnx, CPU, about a tenth of real time) and numbered in order of first appearance, never named. Crosstalk makes the clustering invent extra voices; anyone with under 5 seconds or 3% of the speech is folded into the neighbouring speaker, and `--speaker-threshold` (default 0.6; higher merges more) or `--speakers N` tunes the rest. Once a folder has `speakers.json`, reruns keep the labels. Paragraphs break on every speaker change and carry `**Speaker N:**`; `chunks.jsonl` text has the same labels inline. Words right at a turn boundary can land on the wrong side by a word or two, since Whisper's word times are only accurate to about a second. For meetings, the cliffnotes skill writes `meeting.md` (decisions, action items, open questions, timeline) instead of cliff notes.
+
+## From your phone: distill-web
+
+Transcription runs on this machine on purpose (local Whisper on Metal, nothing uploaded), so the
+machine is the server. `distill-web` is the page in front of it: a box for a link, the queue and the
+batch's state, and the library with every page readable in place.
+
+```
+distill-web                  # http://127.0.0.1:8766/, this machine only
+distill-web --tailscale      # the same on your Tailscale address, reachable from your other devices
+```
+
+Pasting a link appends it to `queue.txt` and starts `distill-batch --publish` if none is running; the
+batch transcribes, writes the notes headlessly in Claude Code, verifies the quotes, renders the page
+and queues it in `publish-pending.txt`. Pages are readable right away at `/<slug>/local.html`; say
+"publish pending" in Claude Code when you want them as Artifacts too.
+
+There is no login on the page, so bind it only to localhost or to Tailscale, which is the login. For
+a link other people can use, put a Cloudflare Tunnel with Access in front of the localhost port.
+
+## Ask the library
+
+```
+ask "how does she keep humidity up without a floor drain"
+ask "front lever" --top 5 --json
+```
+
+`ask` ranks every section across every transcript against the words in the question and prints the
+best passages as markdown: the talk, a timestamp link to the first matching word, the section title
+and the matching sentence with the hits in bold. It is deterministic (BM25 plus a bonus for the words
+appearing together), so it is a map of where to read, not an answer; paste it into Claude Code and
+ask the question again with the passages in context, or call `read` on a section through the MCP
+server, where `ask` is also a tool.
 
 ## Other languages
 

@@ -91,9 +91,10 @@ for item in "${ITEMS[@]}"; do
     log "FAILED notes (verify-quotes): $folder"
   fi
 done
-# drop the processed lines from the queue, keep comments
+# drop the processed lines from the queue; keep comments and anything added while this batch ran
 if [[ $DRY -eq 0 ]]; then
-  grep -E '^\s*(#|$)' "$QUEUE" > "$QUEUE.tmp" || true; mv "$QUEUE.tmp" "$QUEUE"
+  printf '%s\n' "${ITEMS[@]}" > "$QUEUE.done-items"
+  grep -vxFf "$QUEUE.done-items" "$QUEUE" > "$QUEUE.tmp" || true; mv "$QUEUE.tmp" "$QUEUE"; rm -f "$QUEUE.done-items"
 fi
 library >/dev/null 2>&1 && log "library index refreshed"
 log "batch end: $ok ok, $bad failed"

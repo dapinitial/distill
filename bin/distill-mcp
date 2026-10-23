@@ -123,6 +123,18 @@ def find(phrase: str, slug: str | None = None) -> str:
 
 
 @mcp.tool()
+def ask(question: str, top: int = 8, slug: str | None = None) -> dict:
+    """Which talks say something about this, and where: the best-matching sections across the library (BM25 over
+    chunks.jsonl, no model), each with the talk, a timestamp link to the first matching word, the section title and
+    the matching sentence. Use `read` with the slug and section number for the full passage."""
+    cmd = [str(HERE / "ask"), question, "--top", str(top), "--json"] + (["--slug", slug] if slug else [])
+    r = run(cmd)
+    if r.returncode != 0:
+        raise ToolError((r.stderr or r.stdout).strip() or "ask failed")
+    return json.loads(r.stdout)
+
+
+@mcp.tool()
 def transcribe_start(source: str, lang: str = "en", speakers: int | None = None, video: bool = False,
                      slug: str | None = None) -> dict:
     """Start the local pipeline on a URL (YouTube or anything yt-dlp handles) or a media file path. Returns a job

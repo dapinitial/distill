@@ -1,0 +1,180 @@
+#!/usr/bin/env python3
+"""ask: which talks said something about this, and where.
+
+  ask "two factor mushroom yields" [--top 8] [--slug SLUG] [--json]
+
+Ranks every section (chunks.jsonl) across the library against the words in the question, with a
+bonus when the words appear together as a phrase, and prints the best passages as markdown you can
+drop straight into Claude Code: the talk, a timestamp link to the exact moment, the section title,
+and the sentence that matched with the hits in bold. Deterministic (BM25 over the sections, no model),
+so the same question always gives the same answer and nothing leaves the machine.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+import re
+import sys
+from collections import Counter
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from distill_common import hms, norm_tokens, stamp  # noqa: E402
+
+OUT = Path(os.environ.get("DISTILL_OUT", Path(__file__).resolve().parent.parent / "out"))
+STOP = set("a an and are as at be but by for from had has have he her his i if in into is it its me my of on or our "
+           "she so that the their them then there these they this to um uh was we were what when which who will with "
+           "you your yeah like just really gonna okay".split())
+K1, B = 1.5, 0.75
+SENT_END = re.compile(r"(?<=[.!?])\s+")
+
+
+def stem(t: str) -> str:
+    """Just enough to let 'drain' find 'drains': drop a trailing s (not ss, not short words)."""
+    return t[:-1] if len(t) > 3 and t.endswith("s") and not t.endswith("ss") else t
+
+
+def toks(text: str) -> list[str]:
+    return [stem(t) for t in norm_tokens(text) if t]
+
+
+def load_library(only: str | None = None) -> list[dict]:
+    docs = []
+    for src_path in sorted(OUT.glob("*/source.json")):
+        folder = src_path.parent
+        if only and folder.name != only:
+            continue
+        chunks_path = folder / "chunks.jsonl"
+        if not chunks_path.exists():
+            continue
+        src = json.loads(src_path.read_text())
+        for line in chunks_path.read_text().splitlines():
+            if not line.strip():
+                continue
+            c = json.loads(line)
+            tk = toks(c["text"])
+            docs.append({"folder": folder, "slug": folder.name, "title": src.get("title") or folder.name, "source": src,
+                         "chunk": c, "tokens": tk, "tf": Counter(tk)})
+    return docs
+
+
+def score(docs: list[dict], terms: list[str], phrase: list[str]) -> list[tuple[float, dict]]:
+    n = len(docs) or 1
+    avgdl = sum(len(d["tokens"]) for d in docs) / n
+    df = Counter()
+    for d in docs:
+        for t in set(terms):
+            if d["tf"].get(t):
+                df[t] += 1
+    out = []
+    for d in docs:
+        s = 0.0
+        dl = len(d["tokens"]) or 1
+        for t in terms:
+            f = d["tf"].get(t, 0)
+            if not f:
+                continue
+            idf = math.log(1 + (n - df[t] + 0.5) / (df[t] + 0.5))
+            s += idf * f * (K1 + 1) / (f + K1 * (1 - B + B * dl / avgdl))
+        if s and len(phrase) > 1:
+            toks = d["tokens"]
+            for i in range(len(toks) - len(phrase) + 1):
+                if toks[i:i + len(phrase)] == phrase:
+                    s *= 1.6
+                    break
+        if s:
+            out.append((s, d))
+    out.sort(key=lambda x: (-x[0], x[1]["slug"], x[1]["chunk"]["index"]))
+    return out
+
+
+def best_sentence(text: str, terms: set[str]) -> str:
+    sents = SENT_END.split(text.strip())
+    scored = [(sum(1 for t in toks(s) if t in terms), -i, s) for i, s in enumerate(sents)]
+    hits, _, sent = max(scored)
+    if hits == 0:
+        return sents[0]
+    return sent
+
+
+def bold(sentence: str, terms: set[str]) -> str:
+    def rep(m):
+        w = m.group(0)
+        return f"**{w}**" if (toks(w) or [""])[0] in terms else w
+    return re.sub(r"[\w'’]+", rep, sentence)
+
+
+def moment(d: dict, terms: set[str]) -> float:
+    """The first matched word's time inside the section, from transcript.json; the section start if unavailable."""
+    c = d["chunk"]
+    try:
+        words = json.loads((d["folder"] / "transcript.json").read_text())["words"]
+    except (OSError, ValueError, KeyError):
+        return c["start"]
+    for w in words:
+        if c["start"] <= w["start"] <= c["end"] and (toks(w["word"]) or [""])[0] in terms:
+            return max(c["start"], w["start"] - 2)
+    return c["start"]
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("question", nargs="+")
+    ap.add_argument("--top", type=int, default=8, help="passages to show (default 8)")
+    ap.add_argument("--per-talk", type=int, default=3, help="at most this many passages from one talk (default 3)")
+    ap.add_argument("--slug", help="search one transcript folder only")
+    ap.add_argument("--json", action="store_true", help="machine-readable output")
+    ap.add_argument("--min", type=float, default=0.3, help="drop passages scoring under this fraction of the best (default 0.3)")
+    a = ap.parse_args()
+    question = " ".join(a.question)
+    phrase = toks(question)
+    terms = [t for t in phrase if t not in STOP] or phrase
+    if not terms:
+        sys.exit("ask: no searchable words in the question")
+    docs = load_library(a.slug)
+    if not docs:
+        sys.exit(f"ask: no transcripts under {OUT}")
+    ranked = score(docs, terms, phrase)
+    tset = set(terms)
+    picked, per = [], Counter()
+    top_score = ranked[0][0] if ranked else 0
+    for s, d in ranked:
+        if s < top_score * a.min:
+            break
+        if per[d["slug"]] >= a.per_talk:
+            continue
+        per[d["slug"]] += 1
+        picked.append((s, d))
+        if len(picked) >= a.top:
+            break
+    talks = len({d["slug"] for _, d in picked})
+    results = []
+    for s, d in picked:
+        c = d["chunk"]
+        t = moment(d, tset)
+        sent = best_sentence(c["text"], tset)
+        results.append({"slug": d["slug"], "title": d["title"], "score": round(s, 3), "section": c["index"],
+                        "section_title": c.get("title") or "", "start": t, "stamp": stamp(t, d["source"]),
+                        "sentence": sent, "folder": str(d["folder"])})
+    if a.json:
+        print(json.dumps({"question": question, "terms": terms, "talks": talks, "results": results}, ensure_ascii=False, indent=1))
+        return
+    if not results:
+        print(f'ask: nothing in {len({d["slug"] for d in docs})} talks mentions {", ".join(terms)}')
+        return
+    print(f'## ask: "{question}"  ({len(results)} passages in {talks} of {len({d["slug"] for d in docs})} talks)\n')
+    last = None
+    for r in results:
+        if r["slug"] != last:
+            print(f'**{r["title"]}**  `{r["folder"]}`')
+            last = r["slug"]
+        sec = f' {r["section_title"]}' if r["section_title"] else ""
+        print(f'- {r["stamp"]}{sec} — {bold(r["sentence"], tset)}')
+    print()
+    print("Timestamps point at the first matching word; `read` the section or open the page for the rest.")
+
+
+if __name__ == "__main__":
+    main()

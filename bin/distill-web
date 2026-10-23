@@ -1,0 +1,258 @@
+#!/usr/bin/env python3
+"""distill-web: paste a link, get it distilled, read the library. One small server on the Mac that
+does the work; reach it from your phone or another machine over Tailscale.
+
+  distill-web [--port 8766] [--host 127.0.0.1 | --tailscale | --host 0.0.0.0] [--no-publish]
+
+GET  /            the page: a box for a link, what is queued and running, the library
+POST /queue       url=<link>  appends to queue.txt and starts distill-batch if none is running
+GET  /status      JSON: queued, running, recent results, the tail of batch.log
+GET  /toc.html, /library.json, /<slug>/local.html …   the library folder, as library --serve does
+
+The batch runs the cliffnotes skill headlessly in Claude Code, exactly as `distill-batch` does, and
+queues finished pages in publish-pending.txt (say "publish pending" in Claude Code to publish them).
+Nothing here authenticates: bind to localhost or to the Tailscale address, never to a public
+interface. Transcription stays on this machine.
+"""
+from __future__ import annotations
+
+import argparse
+import functools
+import html
+import http.server
+import json
+import os
+import re
+import subprocess
+import sys
+import urllib.parse
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+HOME = Path(os.environ.get("DISTILL_HOME", HERE.parent))
+OUT = Path(os.environ.get("DISTILL_OUT", HOME / "out"))
+QUEUE = HOME / "queue.txt"
+DONE = HOME / "queue.done.txt"
+LOCK = OUT / ".batch.lock"
+LOG = OUT / "batch.log"
+URL_RE = re.compile(r"^https?://[^\s<>\"']+$")
+TAILSCALE = Path("/Applications/Tailscale.app/Contents/MacOS/Tailscale")
+
+sys.path.insert(0, str(HERE))
+from distill_common import hms  # noqa: E402
+
+
+def queued() -> list[str]:
+    if not QUEUE.exists():
+        return []
+    return [ln.strip() for ln in QUEUE.read_text().splitlines() if ln.strip() and not ln.lstrip().startswith("#")]
+
+
+def running() -> int | None:
+    pid_file = LOCK / "pid"
+    try:
+        pid = int(pid_file.read_text().strip())
+        os.kill(pid, 0)
+        return pid
+    except (OSError, ValueError):
+        return None
+
+
+def recent(n: int = 8) -> list[dict]:
+    if not DONE.exists():
+        return []
+    rows = []
+    for ln in DONE.read_text().splitlines()[-n:]:
+        parts = ln.split("\t")
+        if len(parts) >= 3:
+            rows.append({"date": parts[0], "result": parts[1], "item": parts[2], "folder": parts[3] if len(parts) > 3 else ""})
+    return list(reversed(rows))
+
+
+def log_tail(n: int = 12) -> list[str]:
+    if not LOG.exists():
+        return []
+    return LOG.read_text().splitlines()[-n:]
+
+
+def start_batch(publish: bool) -> int:
+    """Launch distill-batch detached (it takes its own lock, so a second start is a no-op)."""
+    cmd = [str(HERE / "distill-batch"), str(QUEUE)] + (["--publish"] if publish else [])
+    OUT.mkdir(parents=True, exist_ok=True)
+    with open(OUT / "web-batch.log", "ab") as log:
+        p = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                             cwd=str(HOME), start_new_session=True)
+    return p.pid
+
+
+def enqueue(url: str) -> str:
+    url = url.strip()
+    if not URL_RE.match(url):
+        return "That does not look like a link."
+    items = queued()
+    if url in items:
+        return "Already queued."
+    with open(QUEUE, "a") as f:
+        f.write(url + "\n")
+    return "Queued."
+
+
+def library_rows() -> list[dict]:
+    rows = []
+    for src_path in sorted(OUT.glob("*/source.json")):
+        folder = src_path.parent
+        try:
+            src = json.loads(src_path.read_text())
+        except ValueError:
+            continue
+        notes = folder / "cliffnotes.md"
+        point = ""
+        if notes.exists():
+            m = re.search(r"^## The point\s*\n(.+?)(?:\n## |\Z)", notes.read_text(), re.S | re.M)
+            point = re.sub(r"\s+", " ", m.group(1)).strip() if m else ""
+        art = None
+        if (folder / "artifact.json").exists():
+            try:
+                art = json.loads((folder / "artifact.json").read_text()).get("url")
+            except ValueError:
+                pass
+        rows.append({"slug": folder.name, "title": src.get("title") or folder.name, "uploader": src.get("uploader"),
+                     "duration": float(src.get("duration") or 0), "created": (src.get("created_at") or "")[:10],
+                     "point": point, "url": src.get("url"), "artifact": art,
+                     "local": (folder / "local.html").exists(), "page": (folder / "index.html").exists()})
+    rows.sort(key=lambda r: r["created"], reverse=True)
+    return rows
+
+
+def page(msg: str = "") -> str:
+    esc = lambda s: html.escape(str(s), quote=True)  # noqa: E731
+    pid = running()
+    q = queued()
+    rows = library_rows()
+    status = (f'<span class="on">running</span> as pid {pid}' if pid else '<span class="off">idle</span>')
+    qhtml = "".join(f"<li><code>{esc(x)}</code></li>" for x in q) or "<li class='muted'>nothing queued</li>"
+    rhtml = "".join(f'<li><span class="{ "ok" if r["result"] == "ok" else "bad"}">{esc(r["result"])}</span> {esc(r["date"])} '
+                    f'<code>{esc(r["item"])}</code>' + (f' → <a href="/{esc(Path(r["folder"]).name)}/local.html">{esc(Path(r["folder"]).name)}</a>' if r["folder"] and r["result"] == "ok" else "") + "</li>"
+                    for r in recent()) or "<li class='muted'>no results yet</li>"
+    lib = []
+    for r in rows:
+        link = f'/{esc(r["slug"])}/local.html' if r["local"] else (f'/{esc(r["slug"])}/index.html' if r["page"] else None)
+        title = f'<a href="{link}">{esc(r["title"])}</a>' if link else esc(r["title"])
+        meta = " · ".join(x for x in [esc(r["uploader"] or ""), hms(r["duration"]), r["created"]] if x)
+        extra = (f' · <a href="{esc(r["artifact"])}" target="_blank" rel="noopener">artifact ↗</a>' if r["artifact"] else "") + \
+                (f' · <a href="{esc(r["url"])}" target="_blank" rel="noopener">source ↗</a>' if r["url"] else "")
+        lib.append(f'<li><h3>{title}</h3><div class="meta">{meta}{extra}</div>' + (f'<p>{esc(r["point"])}</p>' if r["point"] else "") + "</li>")
+    log = esc("\n".join(log_tail()))
+    return f"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>distill</title>
+<style>
+:root {{ --bg:#f5f6f8; --panel:#fff; --fg:#1c2029; --muted:#6a7282; --line:#dfe3ea; --accent:#0d6b70; --ok:#2e7d32; --bad:#b3261e }}
+@media (prefers-color-scheme: dark) {{ :root {{ --bg:#13161d; --panel:#1b1f28; --fg:#e4e7ee; --muted:#949caf; --line:#2b313d; --accent:#5cc8cc; --ok:#7bd389; --bad:#ff8a80; color-scheme: dark }} }}
+* {{ box-sizing: border-box }} body {{ margin:0; background:var(--bg); color:var(--fg); font:15px/1.5 "IBM Plex Sans", -apple-system, Helvetica, Arial, sans-serif; padding: 20px max(16px, 4vw) 48px }}
+a {{ color: var(--accent) }} .wrap {{ max-width: 760px; margin: 0 auto }}
+h1 {{ font: 600 1.4rem/1.2 "IBM Plex Serif", Georgia, serif; margin: 0 0 4px }} h2 {{ font: 600 .8rem/1 inherit; letter-spacing:.08em; text-transform: uppercase; color: var(--muted); margin: 26px 0 10px }}
+form {{ display:flex; gap:8px; flex-wrap: wrap }} input[type=url] {{ flex: 1 1 260px; min-width: 0; font: inherit; padding: 9px 12px; border:1px solid var(--line); border-radius: 6px; background: var(--panel); color: var(--fg) }}
+button {{ font: inherit; padding: 9px 14px; border: 1px solid var(--accent); border-radius: 6px; background: var(--accent); color: #fff; cursor: pointer }}
+.msg {{ margin: 8px 0 0; color: var(--accent) }} .muted {{ color: var(--muted) }} .on {{ color: var(--ok); font-weight: 600 }} .off {{ color: var(--muted) }} .ok {{ color: var(--ok) }} .bad {{ color: var(--bad) }}
+ul {{ padding-left: 1.1rem; margin: 0 }} li {{ margin: 4px 0 }} code {{ font: .85rem "IBM Plex Mono", ui-monospace, Menlo, monospace; word-break: break-all }}
+pre {{ background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 10px 12px; font: .8rem/1.4 "IBM Plex Mono", ui-monospace, Menlo, monospace; overflow-x: auto; margin: 0 }}
+ol.lib {{ list-style: none; padding: 0 }} ol.lib li {{ padding: 10px 0; border-bottom: 1px solid var(--line) }} ol.lib h3 {{ font: 600 1rem/1.3 inherit; margin: 0 0 2px }} ol.lib h3 a {{ color: inherit; text-decoration: none }} ol.lib h3 a:hover {{ color: var(--accent) }}
+ol.lib .meta {{ font-size: .8rem; color: var(--muted) }} ol.lib p {{ margin: 6px 0 0; max-width: 65ch; font-size: .92rem }}
+</style></head><body><div class="wrap">
+<h1>distill</h1><p class="muted">Paste a link. It is transcribed here, on this machine, then turned into cliff notes you can read below.</p>
+<form method="post" action="/queue"><input type="url" name="url" placeholder="https://www.youtube.com/watch?v=…" required autofocus><button type="submit">Distill</button></form>
+{f'<p class="msg">{esc(msg)}</p>' if msg else ''}
+<h2>Batch: {status}</h2>
+<ul>{qhtml}</ul>
+<h2>Recent</h2>
+<ul>{rhtml}</ul>
+<h2>Log</h2>
+<pre>{log or 'no log yet'}</pre>
+<h2>Library · {len(rows)} talks</h2>
+<ol class="lib">{''.join(lib)}</ol>
+<p class="muted">Also: <a href="/toc.html">table of contents</a> · <a href="/library.json">library.json</a> · <a href="/status">status JSON</a></p>
+</div>
+<script>if (document.querySelector('.on')) setTimeout(function () {{ location.replace('/'); }}, 20000);</script>
+</body></html>"""
+
+
+class Handler(http.server.SimpleHTTPRequestHandler):
+    publish = True
+
+    def end_headers(self):
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Cache-Control", "no-store")
+        super().end_headers()
+
+    def log_message(self, fmt, *args):
+        sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
+
+    def send_html(self, body: str, code: int = 200):
+        data = body.encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self):
+        path = urllib.parse.urlparse(self.path)
+        if path.path == "/":
+            msg = urllib.parse.parse_qs(path.query).get("m", [""])[0]
+            return self.send_html(page(msg))
+        if path.path == "/status":
+            body = json.dumps({"queued": queued(), "running": running(), "recent": recent(), "log": log_tail()}, indent=1).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        return super().do_GET()
+
+    def do_POST(self):
+        path = urllib.parse.urlparse(self.path)
+        if path.path != "/queue":
+            return self.send_html("not found", 404)
+        n = int(self.headers.get("Content-Length") or 0)
+        form = urllib.parse.parse_qs(self.rfile.read(min(n, 65536)).decode(errors="replace"))
+        url = (form.get("url") or [""])[0]
+        msg = enqueue(url)
+        if msg == "Queued." and not running():
+            pid = start_batch(self.publish)
+            msg = f"Queued and started the batch (pid {pid})."
+        self.send_response(303)
+        self.send_header("Location", "/?m=" + urllib.parse.quote(msg))
+        self.end_headers()
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--port", type=int, default=8766)
+    ap.add_argument("--host", default="127.0.0.1", help="address to bind (default localhost only)")
+    ap.add_argument("--tailscale", action="store_true", help="bind to this machine's Tailscale address")
+    ap.add_argument("--no-publish", action="store_true", help="do not queue finished pages for publishing")
+    a = ap.parse_args()
+    host = a.host
+    if a.tailscale:
+        try:
+            host = subprocess.run([str(TAILSCALE), "ip", "-4"], capture_output=True, text=True, check=True).stdout.strip().splitlines()[0]
+        except (OSError, subprocess.CalledProcessError, IndexError):
+            sys.exit("distill-web: Tailscale is not installed or not running (open Tailscale and turn it on)")
+    OUT.mkdir(parents=True, exist_ok=True)
+    QUEUE.touch(exist_ok=True)
+    Handler.publish = not a.no_publish
+    handler = functools.partial(Handler, directory=str(OUT))
+    try:
+        srv = http.server.ThreadingHTTPServer((host, a.port), handler)
+    except OSError as e:
+        sys.exit(f"distill-web: cannot bind {host}:{a.port}: {e}" + (" (is Tailscale on?)" if a.tailscale else ""))
+    print(f"distill-web at http://{host}:{a.port}/  (ctrl-c to stop)")
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()
