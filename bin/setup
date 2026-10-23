@@ -11,6 +11,23 @@ EXPECTED_SHA1="4af2b29d7ec73d781377bfd1758ca957a807e941"   # published in whispe
 
 say() { printf '\033[1m%s\033[0m\n' "$*"; }
 
+if [[ "${1:-}" == "--mcp" ]]; then
+  say "MCP server: the mcp SDK in .venv"
+  ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+  [[ -x "$ROOT/.venv/bin/python" ]] || python3 -m venv "$ROOT/.venv"
+  "$ROOT/.venv/bin/python" -c "import mcp" 2>/dev/null || "$ROOT/.venv/bin/pip" install -q mcp
+  "$ROOT/bin/distill-mcp" --check | head -1
+  cat <<EOF
+
+Claude Desktop: add this to ~/Library/Application Support/Claude/claude_desktop_config.json
+  "mcpServers": { "distill": { "command": "$ROOT/bin/distill-mcp",
+                               "env": { "DISTILL_OUT": "${DISTILL_OUT:-$ROOT/out}" } } }
+Claude Code (another project, without the skills):
+  claude mcp add distill -- $ROOT/bin/distill-mcp
+EOF
+  exit 0
+fi
+
 if [[ "${1:-}" == "--speakers" ]]; then
   say "Speaker labels: sherpa-onnx in .venv + two ONNX models"
   ROOT="$(cd "$(dirname "$0")/.." && pwd)"

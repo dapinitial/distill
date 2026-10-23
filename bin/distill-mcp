@@ -1,0 +1,227 @@
+#!/usr/bin/env python3
+"""
+distill-mcp: the distill library as an MCP server (stdio), for Claude Desktop and any other MCP client.
+
+  distill-mcp                 # speaks MCP on stdin/stdout; clients start it themselves
+  distill-mcp --check         # list the tools and the library, then exit
+
+A thin wrapper: every tool shells out to the scripts in bin/, so there is one implementation of
+the logic. Tools: library, read, find, transcribe_start, transcribe_status, write_notes, render.
+Resources: distill://<slug>/<file>. Prompt: cliffnotes (the skill text, so a client without the
+skill follows the same rules). Runs inside .venv (bin/setup --mcp installs the SDK).
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import uuid
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+HOME = Path(os.environ.get("DISTILL_HOME", HERE.parent))
+VENV_PY = HOME / ".venv" / "bin" / "python"
+if VENV_PY.exists() and Path(sys.prefix).resolve() != VENV_PY.parent.parent.resolve():
+    os.execv(str(VENV_PY), [str(VENV_PY), __file__] + sys.argv[1:])
+
+sys.path.insert(0, str(HERE))
+from distill_common import hms, slugify  # noqa: E402
+
+OUT = Path(os.environ.get("DISTILL_OUT", HOME / "out")).expanduser()
+JOBS = OUT / ".jobs"
+FILES = {"notes": "cliffnotes.md", "meeting": "meeting.md", "sections": "sections.md", "transcript": "transcript.md",
+         "translation": "translation.md", "captions": None, "source": "source.json"}
+SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,80}$")
+
+try:
+    from mcp.server.mcpserver import MCPServer
+    from mcp.server.mcpserver.exceptions import ResourceError, ToolError
+except ModuleNotFoundError:
+    sys.exit("distill-mcp: the mcp package is missing; run bin/setup --mcp")
+
+mcp = MCPServer("distill", instructions=(
+    "Local library of transcripts and cliff notes made by distill (whisper.cpp on this Mac). Start with "
+    "`library`; `read` a talk's notes or a transcript section; `find` a phrase across everything. "
+    "`transcribe_start` runs the local pipeline on a URL or file (minutes; poll `transcribe_status`). "
+    "To write notes, follow the `cliffnotes` prompt and submit them with `write_notes`, which verifies "
+    "every quote against the transcript and returns the verifier's report."))
+
+
+def folder(slug: str) -> Path:
+    if not SLUG_RE.match(slug):
+        raise ToolError(f"bad slug: {slug!r}")
+    p = OUT / slug
+    if not (p / "transcript.json").exists():
+        raise ToolError(f"no transcript folder {slug} under {OUT}")
+    return p
+
+
+def run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, capture_output=True, text=True, cwd=str(HOME), **kw)
+
+
+def entry(p: Path) -> dict:
+    src = json.loads((p / "source.json").read_text()) if (p / "source.json").exists() else {}
+    art = json.loads((p / "artifact.json").read_text()) if (p / "artifact.json").exists() else {}
+    return {"slug": p.name, "title": src.get("title", p.name), "url": src.get("url") or src.get("path"),
+            "uploader": src.get("uploader"), "duration": hms(src.get("duration", 0)), "language": src.get("language"),
+            "words": src.get("word_count"), "sections": src.get("section_count"),
+            "speaker_labels": src.get("speaker_labels", False), "created_at": src.get("created_at"),
+            "has": [k for k, f in FILES.items() if f and (p / f).exists()] +
+                   [f"captions:{m.group(1)}" for m in (re.match(r"captions\.(.+)\.md", q.name) for q in p.glob("captions.*.md")) if m],
+            "artifact": art.get("url")}
+
+
+@mcp.tool()
+def library() -> list[dict]:
+    """Every transcript in the library, newest first: slug, title, source, duration, language, which files exist
+    (notes, meeting, sections, transcript, translation, captions), and the published page if any."""
+    rows = [entry(p.parent) for p in OUT.glob("*/transcript.json")]
+    return sorted(rows, key=lambda r: r.get("created_at") or "", reverse=True)
+
+
+@mcp.tool()
+def read(slug: str, part: str = "notes", section: int | None = None) -> str:
+    """Read one file of a transcript folder. part: notes (cliffnotes.md), meeting, sections, transcript, translation,
+    captions (the English captions markdown), source (source.json). For `transcript`, give `section` (1-based,
+    see chunks in `sections`) to get one section; without it, the whole transcript is returned when it is under
+    8,000 words, otherwise the list of sections with their times and first line."""
+    p = folder(slug)
+    if part == "transcript":
+        chunks = [json.loads(l) for l in (p / "chunks.jsonl").read_text().splitlines() if l.strip()]
+        if section is not None:
+            if not 1 <= section <= len(chunks):
+                raise ToolError(f"section must be 1..{len(chunks)}")
+            c = chunks[section - 1]
+            return f"## {section}. [{c['start_hms']}–{c['end_hms']}] {c.get('title') or ''}\n\n{c['text']}"
+        if sum(c["word_count"] for c in chunks) <= 8000:
+            return (p / "transcript.md").read_text()
+        return "\n".join(f"{i}. [{c['start_hms']}–{c['end_hms']}] {c.get('title') or c['text'][:80] + '…'} ({c['word_count']} words)"
+                         for i, c in enumerate(chunks, 1)) + "\n\nLong transcript: call read again with `section`."
+    if part == "captions":
+        cands = sorted(p.glob("captions.*.md"))
+        if not cands:
+            raise ToolError("no captions markdown; run captions-md --write on this folder")
+        return cands[0].read_text()
+    f = FILES.get(part)
+    if not f:
+        raise ToolError(f"part must be one of {', '.join(FILES)}")
+    if not (p / f).exists():
+        raise ToolError(f"{slug} has no {f} yet")
+    return (p / f).read_text()
+
+
+@mcp.tool()
+def find(phrase: str, slug: str | None = None) -> str:
+    """Where a phrase was said: timestamp links with context, in one transcript (slug) or across the whole library."""
+    cmd = [str(HERE / "where")] + ([str(folder(slug))] if slug else ["--all"]) + [phrase]
+    r = run(cmd)
+    return (r.stdout + r.stderr).strip() or "not found"
+
+
+@mcp.tool()
+def transcribe_start(source: str, lang: str = "en", speakers: int | None = None, video: bool = False,
+                     slug: str | None = None) -> dict:
+    """Start the local pipeline on a URL (YouTube or anything yt-dlp handles) or a media file path. Returns a job
+    id; poll transcribe_status. lang: 'en', 'auto' or a code. speakers: 0 to detect, N when known, omit for none."""
+    JOBS.mkdir(parents=True, exist_ok=True)
+    job = uuid.uuid4().hex[:8]
+    cmd = [str(HERE / "transcribe"), source, "--lang", lang]
+    if speakers is not None:
+        cmd += ["--speakers"] + ([str(speakers)] if speakers > 0 else [])
+    if video:
+        cmd.append("--video")
+    if slug:
+        cmd += ["--slug", slugify(slug)]
+    log = JOBS / f"{job}.log"
+    proc = subprocess.Popen(cmd, stdout=open(JOBS / f"{job}.out", "w"), stderr=open(log, "w"), cwd=str(HOME))
+    (JOBS / f"{job}.json").write_text(json.dumps({"job": job, "pid": proc.pid, "cmd": cmd, "started": time.time()}))
+    return {"job": job, "status": "running", "hint": "a 10-minute video takes about 35 s, an hour about 3–4 min"}
+
+
+@mcp.tool()
+def transcribe_status(job: str) -> dict:
+    """Status of a transcribe job: running, done (with the folder slug) or failed (with the log tail)."""
+    if not re.match(r"^[0-9a-f]{8}$", job):
+        raise ToolError("bad job id")
+    meta = json.loads((JOBS / f"{job}.json").read_text())
+    log = (JOBS / f"{job}.log").read_text() if (JOBS / f"{job}.log").exists() else ""
+    out = (JOBS / f"{job}.out").read_text().strip() if (JOBS / f"{job}.out").exists() else ""
+    try:
+        os.kill(meta["pid"], 0)
+        alive = True
+    except OSError:
+        alive = False
+    if alive:
+        return {"job": job, "status": "running", "elapsed_s": round(time.time() - meta["started"]), "log_tail": log[-600:]}
+    if out and Path(out).exists():
+        return {"job": job, "status": "done", "slug": Path(out).name, "log_tail": log[-800:]}
+    return {"job": job, "status": "failed", "log_tail": log[-1200:]}
+
+
+@mcp.tool()
+def write_notes(slug: str, markdown: str, kind: str = "notes") -> dict:
+    """Save cliff notes (kind 'notes' → cliffnotes.md) or meeting notes ('meeting' → meeting.md) into the folder and
+    run verify-quotes on them. Returns ok plus the verifier's report; on failures fix the lines it names and call
+    again. Quotes must be verbatim from the transcript; translations go in italics outside the quotes."""
+    p = folder(slug)
+    f = {"notes": "cliffnotes.md", "meeting": "meeting.md", "sections": "sections.md", "translation": "translation.md"}.get(kind)
+    if not f:
+        raise ToolError("kind must be notes, meeting, sections or translation")
+    (p / f).write_text(markdown)
+    if kind in ("sections", "translation"):
+        return {"ok": True, "file": str(p / f), "report": "saved (not verified; only notes and meeting carry quotes)"}
+    r = run([str(HERE / "verify-quotes"), str(p / f)])
+    return {"ok": r.returncode == 0, "file": str(p / f), "report": (r.stdout + r.stderr).strip()}
+
+
+@mcp.tool()
+def render(slug: str) -> dict:
+    """Build the HTML page for a folder: index.html (Artifact-ready fragment) and local.html (standalone, with an
+    embedded player). Publishing as a Claude Artifact needs Claude Code; this only writes the files."""
+    p = folder(slug)
+    r1 = run([str(HERE / "render"), str(p)])
+    r2 = run([str(HERE / "render"), str(p), "--standalone"])
+    ok = r1.returncode == 0 and r2.returncode == 0
+    return {"ok": ok, "index_html": str(p / "index.html"), "local_html": str(p / "local.html"),
+            "log": (r1.stderr + r2.stderr).strip()[-600:]}
+
+
+@mcp.resource("distill://{slug}/{name}", mime_type="text/markdown")
+def resource(slug: str, name: str) -> str:
+    """A file from a transcript folder: cliffnotes.md, transcript.md, sections.md, meeting.md, translation.md,
+    captions.<lang>.md or source.json."""
+    if not re.match(r"^[a-z0-9.-]+\.(md|json)$", name) or "/" in name:
+        raise ResourceError("bad file name")
+    try:
+        return (folder(slug) / name).read_text()
+    except (ToolError, OSError) as e:
+        raise ResourceError(str(e)) from None
+
+
+@mcp.prompt()
+def cliffnotes(slug: str) -> str:
+    """The cliffnotes skill: how to turn a transcript into a five-minute read with verified quotes. Follow it, then
+    submit with write_notes."""
+    skill = (HOME / "skills" / "cliffnotes" / "SKILL.md").read_text()
+    skill = skill.split("\n---\n", 2)[-1] if skill.startswith("---") else skill
+    return (f"Write cliff notes for the transcript `{slug}`. Use `read(\"{slug}\", \"transcript\")` (and "
+            f"`read(\"{slug}\", \"source\")`) in place of the file reads below, `find` in place of `where`, and "
+            f"submit the markdown with `write_notes(\"{slug}\", markdown)` in place of writing the file and running "
+            f"verify-quotes; it runs the verifier for you. Skip step 5 (publishing needs Claude Code).\n\n{skill}")
+
+
+def main() -> None:
+    if "--check" in sys.argv:
+        print("tools:", ", ".join(sorted(t.name for t in mcp._tool_manager.list_tools())))  # noqa: SLF001
+        for row in library():
+            print(f"  {row['slug']}: {row['duration']} {row['language']} {row['has']}")
+        return
+    mcp.run("stdio")
+
+
+if __name__ == "__main__":
+    main()

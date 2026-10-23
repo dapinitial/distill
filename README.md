@@ -88,6 +88,15 @@ Each transcript folder holds:
 | `test` | regression checks for the cleanup rules, sectioning, speakers and verify-quotes |
 | `diarize` | who spoke when, as JSON; used by `transcribe --speakers` |
 | `prune` | delete regenerable media and Whisper caches older than N days; text outputs stay |
+| `distill-mcp` | the library as an MCP server for Claude Desktop and other clients; wraps the scripts above |
+
+## From outside the terminal: MCP
+
+```bash
+bin/setup --mcp        # installs the SDK into .venv and prints the Claude Desktop config line
+```
+
+`distill-mcp` exposes the library to any MCP client: `library`, `read` (notes, a transcript section, sections, meeting notes, captions), `find` (a phrase across every transcript), `transcribe_start` / `transcribe_status` (the pipeline runs for minutes, so it is a job you poll), `write_notes` (saves cliff notes and runs `verify-quotes` on them, so a client that writes notes is held to the same word-for-word rule), and `render`. Each folder's files are also MCP resources (`distill://<slug>/cliffnotes.md`), and the cliffnotes skill is served as an MCP prompt so a client without the skill follows the same steps. Every tool shells out to the scripts in `bin/`; there is one implementation. Publishing a page as a Claude Artifact still needs Claude Code.
 
 ## Sections
 
