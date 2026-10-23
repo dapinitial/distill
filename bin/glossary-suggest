@@ -156,8 +156,12 @@ def main() -> None:
     known = set() if a.include_known else existing_glossary()
 
     print("# 1. Spelling clusters (variant → most common form). Check each before pasting.")
-    cl = clusters(words, known)
-    print("\n".join(cl) if cl else "# none")
+    lang = src.get("language", "en")
+    if lang in ("de", "lb"):
+        print(f"# skipped: '{lang}' capitalises every noun, so the capital-letter heuristic is noise here")
+    else:
+        cl = clusters(words, known)
+        print("\n".join(cl) if cl else "# none")
 
     vtt = src.get("captions")
     vtts = sorted(folder.glob("media/*.vtt"))

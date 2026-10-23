@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """transcribe: a media file or URL -> an LLM-ready transcript folder.
 
-  transcribe <file-or-url> [--out DIR] [--slug NAME] [--lang en] [--glossary FILE]
+  transcribe <file-or-url> [--out DIR] [--slug NAME] [--lang en|auto|es…] [--glossary FILE]
                            [--threads N] [--force] [--section-target 180]
 
 Pipeline: yt-dlp (audio only, URLs) -> ffmpeg 16 kHz mono WAV -> whisper-cli (large-v3-turbo,
@@ -29,8 +29,50 @@ HERE = Path(__file__).resolve().parent
 HOME = Path(os.environ.get("DISTILL_HOME", HERE.parent))
 URL_RE = re.compile(r"^https?://", re.I)
 EOT = 50257  # whisper multilingual vocab: ids >= EOT are special/timestamp tokens
-FILLERS = {"um", "uh", "umm", "uhh", "erm", "uhm", "mm", "mhm"}
-STUTTER_OK = {"that", "had", "very", "no", "bye", "ha", "so", "really", "many", "is"}
+# Per-language cleanup tables. A language without an entry gets no filler removal (we would rather
+# keep a real word than delete one) and only the generic doubled-word rule.
+FILLERS_BY_LANG = {
+    "en": {"um", "uh", "umm", "uhh", "erm", "uhm", "mm", "mhm"},
+    "es": {"eh", "em", "ehm", "mm", "mmm"},
+    "fr": {"euh", "euhm", "hum", "hmm"},
+    "de": {"äh", "ähm", "ehm", "hm", "mh", "mhm"},
+    "it": {"ehm", "eh", "mmm", "mh"},
+    "pt": {"hum", "ahn", "hã", "ã"},
+    "nl": {"uh", "uhm", "eh", "ehm"},
+}
+# Legitimate doubles: "that that is", "no, no", "very very". Never collapsed when alone.
+STUTTER_OK_BY_LANG = {
+    "en": {"that", "had", "very", "no", "bye", "ha", "so", "really", "many", "is"},
+    "es": {"no", "sí", "si", "muy", "ya", "que", "bien"},
+    "fr": {"non", "oui", "très", "si", "là"},
+    "de": {"nein", "ja", "sehr", "so", "doch", "die", "der", "das"},
+    "it": {"no", "sì", "molto", "già", "che"},
+    "pt": {"não", "sim", "muito", "já", "que"},
+    "nl": {"nee", "ja", "heel", "zo"},
+}
+FILLERS = FILLERS_BY_LANG["en"]
+STUTTER_OK = STUTTER_OK_BY_LANG["en"]
+# A punctuated initial prompt in the spoken language keeps Whisper out of its lowercase,
+# unpunctuated mode. Languages not listed run without a prompt.
+PROMPTS = {
+    "en": "Hello, and welcome. Today we're talking about what happened, why it matters, and what comes next.",
+    "es": "Hola, y bienvenidos. Hoy hablamos de lo que pasó, por qué importa y qué viene después.",
+    "fr": "Bonjour, et bienvenue. Aujourd'hui, nous parlons de ce qui s'est passé, pourquoi c'est important et de la suite.",
+    "de": "Hallo und herzlich willkommen. Heute sprechen wir darüber, was passiert ist, warum es wichtig ist und wie es weitergeht.",
+    "it": "Ciao, e benvenuti. Oggi parliamo di cosa è successo, perché conta e cosa viene dopo.",
+    "pt": "Olá, e bem-vindos. Hoje falamos sobre o que aconteceu, por que importa e o que vem a seguir.",
+    "nl": "Hallo, en welkom. Vandaag praten we over wat er gebeurd is, waarom het ertoe doet en wat er nu komt.",
+    "sv": "Hej, och välkomna. I dag pratar vi om vad som hände, varför det spelar roll och vad som kommer härnäst.",
+    "pl": "Witajcie. Dziś rozmawiamy o tym, co się stało, dlaczego to ważne i co będzie dalej.",
+    "ru": "Здравствуйте, и добро пожаловать. Сегодня мы говорим о том, что произошло, почему это важно и что будет дальше.",
+    "tr": "Merhaba, hoş geldiniz. Bugün ne olduğunu, neden önemli olduğunu ve sırada ne olduğunu konuşuyoruz.",
+    "ja": "こんにちは、ようこそ。今日は、何が起きたのか、なぜ重要なのか、そして次に何が来るのかについて話します。",
+    "zh": "大家好，欢迎收看。今天我们聊聊发生了什么，为什么重要，以及接下来会怎样。",
+    "ko": "안녕하세요, 환영합니다. 오늘은 무슨 일이 있었는지, 왜 중요한지, 그리고 다음은 무엇인지 이야기합니다.",
+}
+CREDIT_RE = re.compile(r"^\s*(?:revis\w*|traduc\w*|transcri\w*|subt[ií]tulos|reviewer|translat\w*|subtitles|"
+                       r"untertitel|übersetz\w*|korrektur|sous-titres|traduction|relecture|revisione|traduzione|"
+                       r"sottotitoli|legendas|revisão|tradução|corre[ck]t\w*)\s*:|amara\.org", re.I)
 NONSPEECH_RE = re.compile(r"^\s*[\[\(\*].*[\]\)\*]\s*$")
 SUSPECT_GAP = 5.0   # seconds of silence isolating a first/last segment
 SUSPECT_P = 0.15    # token probability below which whisper is guessing
@@ -105,11 +147,6 @@ def resolve_source(inp: str, out_root: Path, slug_override: str | None, force: b
                     tail = (e.stderr or "").strip().splitlines()[-1:] or ["no error text"]
                     sys.exit(f"transcribe: yt-dlp could not download the audio: {tail[0]}\n"
                              "  If this is a YouTube change, run: brew upgrade yt-dlp")
-                # captions are a bonus: exact language codes only (a wildcard pulls dozens of
-                # auto-translations and trips YouTube's rate limit), and failure is not fatal
-                subprocess.run(["yt-dlp", "--no-playlist", "--no-warnings", "--quiet", "--skip-download",
-                                "--write-subs", "--write-auto-subs", "--sub-langs", "en-orig,en", "--sub-format", "vtt",
-                                "-o", str(media_dir / "audio.%(ext)s"), inp], capture_output=True)
                 return [p for p in media_dir.glob("audio.*") if p.suffix not in (".part", ".vtt")][0]
             media = timer.step("download", dl)
         have_video = [p for p in media_dir.glob("video.*") if p.suffix != ".part"]
@@ -128,7 +165,7 @@ def resolve_source(inp: str, out_root: Path, slug_override: str | None, force: b
             "upload_date": info.get("upload_date"),
             "chapters": [{"title": c.get("title"), "start": float(c["start_time"]), "end": float(c["end_time"])}
                          for c in (info.get("chapters") or [])],
-            "captions": next((str(p.relative_to(out_dir)) for p in sorted(media_dir.glob("audio*.vtt"))), None),
+            "captions": None,  # filled in by fetch_captions once the language is known
         }
     else:
         path = Path(inp).expanduser().resolve()
@@ -146,6 +183,27 @@ def resolve_source(inp: str, out_root: Path, slug_override: str | None, force: b
 
 # ---------- 2. audio + 3. whisper ----------------------------------------------------------
 
+def fetch_captions(source: dict, out_dir: Path, lang: str, timer: Timer) -> None:
+    """Captions are a bonus: the spoken language's track, plus YouTube's English one (human or
+    auto-translated) when the talk is not in English. Exact language codes only: a wildcard pulls
+    dozens of auto-translations and trips YouTube's rate limit. Failure is not fatal."""
+    media_dir = out_dir / "media"
+    if not source.get("url") or source.get("path") or not media_dir.is_dir():
+        return
+    want = [f"{lang}-orig", lang] + (["en"] if lang != "en" else [])
+    have = {p.name for p in media_dir.glob("audio.*.vtt")}
+    if not any(f"audio.{code}.vtt" in have for code in want[:2]):
+        timer.step("captions", lambda: subprocess.run(
+            ["yt-dlp", "--no-playlist", "--no-warnings", "--quiet", "--skip-download", "--write-subs",
+             "--write-auto-subs", "--sub-langs", ",".join(want), "--sub-format", "vtt",
+             "-o", str(media_dir / "audio.%(ext)s"), source["url"]], capture_output=True))
+    vtts = {p.name: p for p in media_dir.glob("audio.*.vtt")}
+    orig = next((vtts[f"audio.{c}.vtt"] for c in want[:2] if f"audio.{c}.vtt" in vtts), None)
+    source["captions"] = str(orig.relative_to(out_dir)) if orig else None
+    en = vtts.get("audio.en.vtt") if lang != "en" else None
+    source["captions_translated"] = str(en.relative_to(out_dir)) if en else None
+
+
 def to_wav(media: Path, wav: Path, force: bool, timer: Timer) -> None:
     if wav.exists() and not force:
         log("  ffmpeg: skipped, have audio.wav")
@@ -155,11 +213,22 @@ def to_wav(media: Path, wav: Path, force: bool, timer: Timer) -> None:
          "-c:a", "pcm_s16le", str(wav)]))
 
 
-PROMPT = "Hello, and welcome. Today we're talking about what happened, why it matters, and what comes next."
+PROMPT = PROMPTS["en"]
+DETECTED_RE = re.compile(r"auto-detected language: (\w+) \(p = ([0-9.]+)\)")
+
+
+def detect_language(wav: Path, model: Path, threads: int) -> tuple[str, float]:
+    """Whisper's own language id on the first 30 s; about a second of work."""
+    r = subprocess.run(["whisper-cli", "-m", str(model), "-f", str(wav), "-l", "auto", "--detect-language",
+                        "-t", str(threads)], capture_output=True, text=True)
+    m = DETECTED_RE.search(r.stderr + r.stdout)
+    if not m:
+        sys.exit("transcribe: could not detect the language; pass --lang <code>")
+    return m.group(1), float(m.group(2))
 
 
 def whisper(wav: Path, prefix: Path, model: Path, lang: str, threads: int, force: bool, timer: Timer,
-            prompt: str = PROMPT) -> dict:
+            prompt: str | None = PROMPT) -> dict:
     out = prefix.with_suffix(".json")
     if out.exists() and not force:
         log("  whisper: skipped, have whisper.json (use --force to redo)")
@@ -167,7 +236,7 @@ def whisper(wav: Path, prefix: Path, model: Path, lang: str, threads: int, force
         if not model.exists():
             sys.exit(f"transcribe: model not found at {model} (run bin/setup)")
         cmd = ["whisper-cli", "-m", str(model), "-f", str(wav), "-l", lang, "-t", str(threads),
-               "-oj", "-ojf", "-of", str(prefix), "-np", "-pp", "--prompt", prompt]
+               "-oj", "-ojf", "-of", str(prefix), "-np", "-pp"] + (["--prompt", prompt] if prompt else [])
         timer.step("whisper", lambda: run(cmd, stdout=subprocess.DEVNULL,
                                            stderr=open(prefix.with_suffix(".log"), "w")))
     return json.loads(out.read_text())
@@ -200,11 +269,14 @@ def words_from_whisper(data: dict) -> tuple[list[dict], list[dict], list[dict]]:
 
     # Whisper hallucinates on silence: subtitle credits before the talk starts, "Thanks for
     # watching" after it ends. Drop a first/last segment that is isolated by >= 5 s of silence
-    # and contains a word the model itself barely believed (p < 0.15). Keep a record.
+    # and either contains a word the model itself barely believed (p < 0.15) or reads like a
+    # subtitle credit ("Revisor: ...", "Translator: ...", amara.org), which it learned from
+    # captioned training data and which no speaker says out loud. Keep a record.
     dropped: list[dict] = []
     def suspect(seg, neighbour, lead):
         gap = (neighbour[0]["start"] - seg[-1]["end"]) if lead else (seg[0]["start"] - neighbour[-1]["end"])
-        return gap >= SUSPECT_GAP and min(w["p"] for w in seg) < SUSPECT_P
+        credit = CREDIT_RE.search(" ".join(w["word"] for w in seg)) is not None
+        return gap >= SUSPECT_GAP and (min(w["p"] for w in seg) < SUSPECT_P or credit)
     while len(segs) > 1 and suspect(segs[0], segs[1], True):
         dropped.append(segs.pop(0))
     while len(segs) > 1 and suspect(segs[-1], segs[-2], False):
@@ -255,17 +327,53 @@ def drop_inline_nonspeech(words: list[dict]) -> list[dict]:
 TERMINAL = ".?!"
 
 
+def collapse_loops(words: list[dict], min_n: int = 2, max_n: int = 12, min_times: int = 3) -> tuple[list[dict], list[dict]]:
+    """Whisper over applause or music can repeat one phrase for seconds: 'Thank you. Thank you. Thank you. ...'.
+    A phrase of 2–12 words said 3+ times in a row is kept once; if the loop runs to the very end of the
+    file, no copy is kept, since nothing real ends that way. Each collapse is reported."""
+    out = list(words)
+    report: list[dict] = []
+    i = 0
+    while i < len(out):
+        hit = False
+        for n in range(min_n, max_n + 1):  # smallest unit first, so a 4-word loop is one unit x15, not 12 words x5
+            if i + n * min_times > len(out):
+                break
+            unit = [norm_token(x["word"]) for x in out[i:i + n]]
+            if not all(unit):
+                continue
+            times = 1
+            while i + (times + 1) * n <= len(out) and \
+                    [norm_token(x["word"]) for x in out[i + times * n:i + (times + 1) * n]] == unit:
+                times += 1
+            if times < min_times:
+                continue
+            end = i + times * n
+            at_end = end == len(out)
+            report.append({"start": out[i]["start"], "text": " ".join(x["word"] for x in out[i:i + n]),
+                           "times": times, "kept": 0 if at_end else 1})
+            del out[i + (0 if at_end else n):end]
+            if not at_end:
+                i += n
+            hit = True
+            break
+        if not hit:
+            i += 1
+    return out, report
+
+
 def _move_trailing_punct(src: dict, dst: dict | None) -> None:
     m = re.search(r"[.,!?;:]+$", src["word"])
     if m and dst is not None and not re.search(r"[.,!?;:]$", dst["word"]):
         dst["word"] += m.group(0)
 
 
-def remove_fillers(words: list[dict]) -> tuple[list[dict], int]:
+def remove_fillers(words: list[dict], lang: str = "en") -> tuple[list[dict], int]:
+    fillers = FILLERS_BY_LANG.get(lang, set())
     out: list[dict] = []
     removed = 0
     for w in words:
-        if norm_token(w["word"]) in FILLERS:
+        if norm_token(w["word"]) in fillers:
             _move_trailing_punct(w, out[-1] if out else None)
             removed += 1
             continue
@@ -273,8 +381,9 @@ def remove_fillers(words: list[dict]) -> tuple[list[dict], int]:
     return out, removed
 
 
-def remove_stutters(words: list[dict], max_n: int = 3) -> tuple[list[dict], int]:
+def remove_stutters(words: list[dict], max_n: int = 3, lang: str = "en") -> tuple[list[dict], int]:
     """'I I I think' -> 'I think'; 'you know you know' -> 'you know'. Keeps the last copy."""
+    ok = STUTTER_OK_BY_LANG.get(lang, {"no"})
     removed = 0
     i = 0
     out = list(words)
@@ -287,7 +396,7 @@ def remove_stutters(words: list[dict], max_n: int = 3) -> tuple[list[dict], int]
             b = [norm_token(x["word"]) for x in out[i + n:i + 2 * n]]
             if a != b or not all(a):
                 continue
-            if n == 1 and a[0] in STUTTER_OK:
+            if n == 1 and a[0] in ok:
                 continue
             if any(re.search(r"[.?!]$", x["word"]) for x in out[i:i + n]):
                 continue  # 'No. No.' is emphasis, not a stutter
@@ -375,7 +484,7 @@ def tidy(words: list[dict]) -> list[dict]:
 
 # ---------- 6. sentences, 7. sections -----------------------------------------------------
 
-SENT_END = re.compile(r"[.?!][\"')\]]*$")
+SENT_END = re.compile(r"[.?!。？！][\"')\]」』]*$")
 
 
 def absorb_minor_speakers(turns: list[dict]) -> tuple[list[dict], int]:
@@ -588,7 +697,7 @@ def main() -> None:
     ap.add_argument("input", help="media file or URL")
     ap.add_argument("--out", default=os.environ.get("DISTILL_OUT", str(HOME / "out")), help="output root")
     ap.add_argument("--slug", help="folder name under --out (default: from the title)")
-    ap.add_argument("--lang", default="en", help="language code, or 'auto'")
+    ap.add_argument("--lang", default="en", help="spoken language code, or 'auto' to detect it (Whisper, ~1 s)")
     ap.add_argument("--model", default=os.environ.get("DISTILL_MODEL", str(HOME / "models/ggml-large-v3-turbo.bin")))
     ap.add_argument("--glossary", action="append", default=[], help="extra glossary file (repeatable)")
     ap.add_argument("--threads", type=int, default=min(8, os.cpu_count() or 4))
@@ -605,8 +714,8 @@ def main() -> None:
     ap.add_argument("--speaker-threshold", type=float, default=0.6,
                     help="clustering threshold when detecting speakers; higher merges more (0.5–0.9)")
     ap.add_argument("--no-speakers", action="store_true", help="ignore an existing speakers.json")
-    ap.add_argument("--prompt", default=PROMPT, help="initial prompt for Whisper; a punctuated sentence keeps it "
-                    "producing punctuation and capitals, and it can carry names (see glossary) and jargon")
+    ap.add_argument("--prompt", default=None, help="initial prompt for Whisper (default: a punctuated sentence in "
+                    "the spoken language, which keeps it producing punctuation and capitals); it can carry names")
     ap.add_argument("--quiet", action="store_true")
     a = ap.parse_args()
     if a.quiet:
@@ -636,7 +745,17 @@ def main() -> None:
     wav = out_dir / "audio.wav"
     to_wav(media, wav, a.force, timer)
     model = Path(a.model).expanduser()
-    raw = whisper(wav, out_dir / "whisper", model, a.lang, a.threads, a.force, timer, a.prompt)
+    lang, detected = a.lang, None
+    if lang == "auto":
+        code, p = timer.step("detect-language", lambda: detect_language(wav, model, a.threads))
+        detected = {"code": code, "p": round(p, 3)}
+        lang = code
+        log(f"  language: {code} (p={p:.2f})" + ("  WARNING: low confidence, pass --lang if wrong" if p < 0.5 else ""))
+    prompt = a.prompt if a.prompt is not None else PROMPTS.get(lang)
+    if prompt is None:
+        log(f"  no prompt table for '{lang}': running Whisper without one (pass --prompt to add one)")
+    raw = whisper(wav, out_dir / "whisper", model, lang, a.threads, a.force, timer, prompt)
+    fetch_captions(source, out_dir, lang, timer)
     turns: list[dict] = []
     dz = out_dir / "speakers.json"
     if a.speakers is None and dz.exists() and not a.no_speakers:
@@ -658,8 +777,9 @@ def main() -> None:
         words, dropped, suspect_mid = words_from_whisper(raw)
         words = tidy(words)
         n_raw = len(words)
-        words, n_fill = remove_fillers(words)
-        words, n_stut = remove_stutters(words)
+        words, n_fill = remove_fillers(words, lang)
+        words, n_stut = remove_stutters(words, lang=lang)
+        words, loops = collapse_loops(words)
         gl_paths = [Path(p) for p in a.glossary] + [Path.cwd() / "glossary.txt", HOME / "glossary.txt"]
         gl_paths = [] if a.no_glossary else list(dict.fromkeys(p.resolve() for p in gl_paths if p.exists()))
         rules = load_glossary(gl_paths)
@@ -682,6 +802,7 @@ def main() -> None:
         return words, secs, {"words_raw": n_raw, "fillers_removed": n_fill, "stutter_words_removed": n_stut,
                              "glossary_replacements": n_gl, "glossary_files": [str(p) for p in gl_paths],
                              "dropped_suspect_segments": dropped, "suspect_segments_kept": suspect_mid,
+                             "loops_collapsed": loops,
                              "low_confidence_words": low[:100], "low_confidence_count": len(low)}
 
     words, secs, cleanup = timer.step("cleanup+sections", post)
@@ -691,7 +812,8 @@ def main() -> None:
     timings.update(timer.t)
     timings["total"] = round(sum(v for k, v in timings.items() if k != "total"), 1)
     source.update({
-        "model": model.stem.replace("ggml-", ""), "language": a.lang, "speaker_labels": bool(turns),
+        "model": model.stem.replace("ggml-", ""), "language": lang, "language_detected": detected,
+        "cleanup_tables": lang in FILLERS_BY_LANG, "speaker_labels": bool(turns),
         "speaker_count": len({t["speaker"] for t in turns}) if turns else 0,
         "created_at": dt.datetime.now().astimezone().isoformat(timespec="seconds"),
         "word_count": len(words), "section_count": len(secs), "cleanup": cleanup,
@@ -704,6 +826,8 @@ def main() -> None:
     if len(words) > 200 and sentence_ends < len(words) / 60:
         log(f"  WARNING: almost no punctuation ({sentence_ends} sentence ends in {len(words)} words); sections and "
             "quotes will suffer. Rerun with --force and a different --prompt.")
+    for d in cleanup["loops_collapsed"]:
+        log(f"  loop collapsed at {hms(d['start'])}: \"{d['text'][:50]}\" x{d['times']}, kept {d['kept']}")
     for d in cleanup["suspect_segments_kept"]:
         log(f"  suspect but kept (isolated, p={d['min_p']}) at {hms(d['start'])}: \"{d['text'][:60]}\"")
     if cleanup["low_confidence_count"]:

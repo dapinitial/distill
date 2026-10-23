@@ -53,6 +53,23 @@ check("stutter keeps the first start time", (w[0]["start"], w[0]["word"]), (0.0,
 w, _ = T["remove_stutters"](W("I know that that is true. No. No. very very good"))
 check("legit doubles and punctuated emphasis survive", text(w), "I know that that is true. No. No. very very good")
 
+# --- other languages: tables follow the spoken language --------------------------------------
+w, n = T["remove_fillers"](W("Eh, bueno, mm, sí."), "es")
+check("spanish fillers removed", (text(w), n), ("bueno, sí.", 2))
+w, n = T["remove_fillers"](W("Um, eh, so."), "xx")
+check("unknown language removes nothing", (text(w), n), ("Um, eh, so.", 0))
+w, _ = T["remove_stutters"](W("sí sí claro muy muy bien yo yo creo"), lang="es")
+check("spanish legit doubles survive, stutters collapse", text(w), "sí sí claro muy muy bien yo creo")
+check("guillemets and CJK brackets normalise", norm_tokens("«hola mundo» 「東京」"), ["hola", "mundo", "東京"])
+check("CJK sentence end", bool(T["SENT_END"].search("です。")), True)
+w, rep = T["collapse_loops"](W("fine. Thank you. Thank you. Thank you. Thank you. Thank you."))
+check("loop at the end is dropped entirely", (text(w), rep[0]["times"], rep[0]["kept"]), ("fine.", 5, 0))
+w, rep = T["collapse_loops"](W("we go on go on go on now"))
+check("loop mid-file keeps one copy", (text(w), len(rep)), ("we go on now", 1))
+w, rep = T["collapse_loops"](W("Pizarrón, carpeta, prueba. Pizarrón, carpeta, prueba. Y después"))
+check("two repeats are speech, not a loop", (text(w), rep), ("Pizarrón, carpeta, prueba. Pizarrón, carpeta, prueba. Y después", []))
+check("every prompt is punctuated", all(p.rstrip()[-1] in ".。" for p in T["PROMPTS"].values()), True)
+
 with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as f:
     f.write("# comment\nChatGPT\nchat GPT → ChatGPT\nLama → Llama\nLlama 270b → Llama 2 70B\nClaude Code\n")
     gl = Path(f.name)
@@ -84,6 +101,16 @@ fake = {"transcription": [
 words, dropped, _mid = T["words_from_whisper"](fake)
 check("suspect isolated low-confidence intro dropped, [Music] dropped, punctuation merged",
       (text(words), [d["text"] for d in dropped]), ("Real speech starts.", ["Credits here"]))
+
+credit = {"transcription": [
+    {"text": " Revisor: Claudia Sander", "tokens": [{"text": " Revisor", "id": 1, "p": 0.4, "offsets": {"from": 190, "to": 2650}},
+                                                   {"text": ":", "id": 2, "p": 0.9, "offsets": {"from": 2650, "to": 2650}},
+                                                   {"text": " Claudia", "id": 3, "p": 0.65, "offsets": {"from": 2650, "to": 4980}},
+                                                   {"text": " Sander", "id": 4, "p": 0.9, "offsets": {"from": 4980, "to": 7000}}]},
+    fake["transcription"][1]]}
+credit["transcription"][1]["tokens"][1]["offsets"] = {"from": 21000, "to": 21300}
+words, dropped, _mid = T["words_from_whisper"](credit)
+check("confident subtitle credit on the silent intro is dropped", [d["text"] for d in dropped], ["Revisor: Claudia Sander"])
 
 # --- sentences and sections -------------------------------------------------------------------
 sents = T["sentences"](W("One two. Three four? Five six"))

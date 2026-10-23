@@ -15,7 +15,7 @@ be verified mechanically later.
 ```bash
 transcribe <file-or-url>                 # prints the output folder on stdout, progress on stderr
 transcribe <url> --slug my-name          # choose the folder name
-transcribe <file> --lang auto            # default is English
+transcribe <file> --lang auto            # detect the language (default English); or --lang es
 transcribe <file> --glossary names.txt   # extra glossary for this run (repeatable)
 transcribe <url> --force                 # redo download, audio and Whisper (otherwise cached)
 transcribe <playlist-url> --playlist     # every entry becomes its own folder
@@ -66,7 +66,7 @@ and rerunning is cheap.
 | `transcript.md` | readable: title, source, duration; `## n. [start–end]` per section; a `[mm:ss]` marker at the start of each paragraph (`[h:mm:ss]` for sources over an hour) |
 | `transcript.json` | `words`: every word with `start`/`end` in seconds; `sections` with times |
 | `chunks.jsonl` | one section per line: `index, start, end, start_hms, end_hms, text, word_count` |
-| `source.json` | title, url or path, duration, model, language, word and section counts, `cleanup` stats (incl. low-confidence words), `timings_seconds` per step |
+| `source.json` | title, url or path, duration, model, `language` (+ `language_detected` with Whisper's confidence under `--lang auto`), `captions` and `captions_translated` paths, word and section counts, `cleanup` stats (incl. low-confidence words), `timings_seconds` per step |
 
 Also left in the folder, gitignored: `media/` (download), `audio.wav`, `whisper.json`, `whisper.log`.
 
@@ -103,11 +103,24 @@ with `--force`).
   over music. Tell the user; do not build quotes on them.
 - yt-dlp errors: usually YouTube changed something; `brew upgrade yt-dlp`.
 
+## Languages
+
+Whisper transcribes about a hundred languages; `--lang auto` asks it which one (about a second)
+and everything downstream follows that code: the punctuated prompt, the filler and doubled-word
+tables (en, es, fr, de, it, pt, nl have tables; other languages get no filler removal rather than
+a wrong one, and `source.json → cleanup_tables` says which happened), and the captions fetched.
+For a talk not in English, transcribe also saves YouTube's English captions (the creator's
+translation when one exists, else machine) as `media/audio.en.vtt`; `captions-md <folder> --write`
+turns them into `captions.en.md`, a timestamped English read of the whole talk with no model
+involved. Tell the user the language, and whether cleanup tables existed for it. Translation of
+the transcript itself is the cliffnotes skill's job (it is an LLM task); Whisper's own translate
+mode is not used because large-v3-turbo was fine-tuned for transcription only.
+
 ## Limits
 
 - Without `--speakers`, dialogue is one stream; say so if the user asks who said what.
-- English by default; `--lang auto` works but the cleanup rules are tuned for English, and the
-  word-splitting assumes spaces between words.
+- Word-splitting assumes spaces between words, so Japanese and Chinese get one "word" per Whisper
+  segment: section and quote timing still work, word-level times do not.
 - Word times are Whisper's token offsets (DTW timing is off because flash attention is on);
   they are reliable to about a second, which is all the downstream link needs.
 - Music, overlapping speech and heavy accents degrade like any Whisper run. The

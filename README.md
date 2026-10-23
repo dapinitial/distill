@@ -37,6 +37,8 @@ transcribe "https://www.youtube.com/watch?v=..."     # or a local .mp4/.m4a/.wav
 transcribe talk.mp4 --glossary names.txt --slug talk
 transcribe "<playlist or channel url>" --playlist    # every entry, one folder each
 transcribe "<url>" --video                           # keep 720p video so the page gets frame grabs
+transcribe "<url>" --lang auto                       # any language Whisper knows; notes come out in English
+captions-md out/<slug> --write                       # YouTube's English captions as timestamped markdown
 glossary-suggest out/<slug>                          # names Whisper likely misheard, as glossary lines
 render out/<slug> --open                             # the page, with an embedded player
 library --open                                       # index of everything under out/
@@ -81,6 +83,7 @@ Each transcript folder holds:
 | `render` | one self-contained HTML page per transcript: notes beside the transcript, search, timestamp links, frame grabs when the video is present. `--open` adds an embedded player (YouTube or the local audio) that seeks from any timestamp and highlights the paragraph being spoken |
 | `library` | `out/index.md` and `out/index.html`: every transcript with its date, length, the point, and links |
 | `glossary-suggest` | three deterministic signals for misheard names: spelling clusters, disagreements with YouTube's captions, low-confidence words |
+| `captions-md` | a captions track as timestamped markdown; the no-model way to read a foreign-language talk in English |
 | `distill-batch` | queue runner for unattended transcribe → cliffnotes → verify → library |
 | `test` | regression checks for the cleanup rules, sectioning, speakers and verify-quotes |
 | `diarize` | who spoke when, as JSON; used by `transcribe --speakers` |
@@ -109,6 +112,10 @@ transcribe meeting.m4a --speakers    # or --speakers 3 when you know the count
 
 Speakers are detected locally (pyannote segmentation + TitaNet embeddings via sherpa-onnx, CPU, about a tenth of real time) and numbered in order of first appearance, never named. Crosstalk makes the clustering invent extra voices; anyone with under 5 seconds or 3% of the speech is folded into the neighbouring speaker, and `--speaker-threshold` (default 0.6; higher merges more) or `--speakers N` tunes the rest. Once a folder has `speakers.json`, reruns keep the labels. Paragraphs break on every speaker change and carry `**Speaker N:**`; `chunks.jsonl` text has the same labels inline. Words right at a turn boundary can land on the wrong side by a word or two, since Whisper's word times are only accurate to about a second. For meetings, the cliffnotes skill writes `meeting.md` (decisions, action items, open questions, timeline) instead of cliff notes.
 
+## Other languages
+
+`--lang auto` lets Whisper identify the language (about a second), and the rest of the pipeline follows: the punctuated prompt is given in that language, the filler and doubled-word tables switch (English, Spanish, French, German, Italian, Portuguese and Dutch have tables; anything else gets no filler removal rather than a wrong one), and the captions fetched are the spoken language's plus YouTube's English track. Translation happens in the cliffnotes step, because it is an LLM job: the notes come out in English (or whatever you ask for), while every quote stays in the original language, verbatim and verified, with the translation beside it in italics. `captions-md` turns the English captions into a timestamped read of the whole talk without any model. Whisper's own translate mode is not used: large-v3-turbo was fine-tuned for transcription only and returns the source language when asked to translate.
+
 ## Limits
 
-English by default (`--lang auto` works, cleanup rules are tuned for English). Word times are Whisper's token offsets, accurate to about a second. Speaker detection is not run unless you ask for it.
+Word times are Whisper's token offsets, accurate to about a second. Japanese and Chinese have no spaces, so they get one "word" per Whisper segment. Speaker detection is not run unless you ask for it.

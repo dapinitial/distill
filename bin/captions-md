@@ -1,0 +1,129 @@
+#!/usr/bin/env python3
+"""
+captions-md: turn a captions track into timestamped markdown.
+
+  captions-md <transcript folder> [--lang en] [--write]
+
+Default is the translated track transcribe fetched (YouTube's English captions for a talk in
+another language; a human translation when the creator uploaded one, otherwise machine). With
+--write it lands in the folder as captions.<lang>.md. Deterministic, no model involved, so it is
+the cheap way to read a talk in English end to end; it is not a transcript, and quotes cannot
+be verified against it.
+"""
+from __future__ import annotations
+
+import argparse
+import re
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from distill_common import find_transcript_dir, load_transcript, parse_hms, stamp  # noqa: E402
+
+TIME_RE = re.compile(r"(\d+:\d{2}:\d{2}\.\d{3}) --> (\d+:\d{2}:\d{2}\.\d{3})")
+TAG_RE = re.compile(r"<[^>]+>")
+PARA_SECONDS = 25.0   # start a new paragraph after this much speech...
+PARA_GAP = 1.5        # ...but only at a gap between cues
+
+
+def read_vtt(path: Path) -> list[tuple[float, float, str]]:
+    """Cues as (start, end, text). Rolling duplicates from auto-captions are dropped."""
+    cues: list[tuple[float, float, str]] = []
+    start = end = None
+    text: list[str] = []
+    prev_lines: set[str] = set()
+
+    def flush():
+        # YouTube's auto-captions "roll": each line is shown in two consecutive cues, so a line
+        # already seen in the previous cue is not new speech
+        nonlocal prev_lines
+        if start is not None and text:
+            fresh = [t for t in text if t not in prev_lines]
+            prev_lines = set(text)
+            t = " ".join(fresh).strip()
+            if t:
+                cues.append((start, end, t))
+        text.clear()
+
+    for raw in path.read_text(errors="ignore").splitlines():
+        line = raw.strip()
+        m = TIME_RE.search(line)
+        if m:
+            flush()
+            start, end = parse_hms(m.group(1).split(".")[0]) + float("0." + m.group(1).split(".")[1]), \
+                parse_hms(m.group(2).split(".")[0]) + float("0." + m.group(2).split(".")[1])
+            continue
+        if not line or line.startswith(("WEBVTT", "Kind:", "Language:", "NOTE")) or line.isdigit():
+            if not line:
+                flush()
+            continue
+        if start is None:
+            continue
+        clean = TAG_RE.sub("", line).replace("&nbsp;", " ").replace("&amp;", "&").replace("&gt;", ">").replace("&lt;", "<").strip()
+        if clean and (not text or clean != text[-1]):
+            text.append(clean)
+    flush()
+    return cues
+
+
+def paragraphs(cues: list[tuple[float, float, str]]) -> list[tuple[float, str]]:
+    out: list[tuple[float, str]] = []
+    cur: list[str] = []
+    cur_start = 0.0
+    prev_end = None
+    for s, e, t in cues:
+        if cur and (s - cur_start >= PARA_SECONDS and prev_end is not None and s - prev_end >= PARA_GAP
+                    or s - cur_start >= 3 * PARA_SECONDS):
+            out.append((cur_start, " ".join(cur)))
+            cur = []
+        if not cur:
+            cur_start = s
+        cur.append(t)
+        prev_end = e
+    if cur:
+        out.append((cur_start, " ".join(cur)))
+    return out
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("folder")
+    ap.add_argument("--lang", help="caption language code (default: the translated track, else the original)")
+    ap.add_argument("--write", action="store_true", help="write captions.<lang>.md into the folder")
+    a = ap.parse_args()
+    folder = find_transcript_dir(a.folder)
+    src = (load_transcript(folder).get("source") or {})
+    media = folder / "media"
+    if a.lang:
+        cands = [media / f"audio.{a.lang}-orig.vtt", media / f"audio.{a.lang}.vtt"]
+        vtt = next((c for c in cands if c.exists()), None)
+        lang = a.lang
+    else:
+        rel = src.get("captions_translated") or src.get("captions")
+        vtt = folder / rel if rel else None
+        lang = re.search(r"audio\.([^.]+)\.vtt$", rel).group(1).replace("-orig", "") if rel else "?"
+    if not vtt or not vtt.exists():
+        have = ", ".join(p.name for p in sorted(media.glob("audio.*.vtt"))) or "none"
+        sys.exit(f"captions-md: no captions for '{lang}' in {media} (have: {have})")
+    cues = read_vtt(vtt)
+    if not cues:
+        sys.exit(f"captions-md: {vtt.name} has no cues")
+    kind = "the creator's" if any(k in vtt.name for k in ("-orig",)) else "YouTube's"
+    lines = [f"# {src.get('title', folder.name)} — captions ({lang})", "",
+             f"From {vtt.name}, {len(cues)} cues. Captions, not a transcript: timing is per cue and the words "
+             f"are {kind if lang == src.get('language') else 'a translation'}; quotes cannot be verified against "
+             "this file.", ""]
+    for t, text in paragraphs(cues):
+        lines.append(f"{stamp(t, src)} {text}")
+        lines.append("")
+    md = "\n".join(lines)
+    if a.write:
+        out = folder / f"captions.{lang}.md"
+        out.write_text(md)
+        print(out)
+    else:
+        print(md, end="")
+
+
+if __name__ == "__main__":
+    main()

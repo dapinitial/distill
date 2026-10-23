@@ -91,6 +91,25 @@ Rules:
 - Speaker labels exist only when transcribe ran with `--speakers` (numbered, not named). Without
   them, if two people talk, say "the host" / "the guest" from context and note that attribution
   is inferred. For meetings, ask for `--speakers` (or run `transcribe <file> --speakers`).
+- The footer names what was and was not done: `with N speaker labels` or `no speaker labels`,
+  and `transcript in <language>, notes in <language>` when they differ.
+
+## 3a. Other languages
+
+`source.json → language` is the spoken language. Write the notes in the language the user asked
+for, or English when they did not say; a Spanish talk gets English notes by default, and an
+English talk gets Spanish notes if asked. Only the quotes are different:
+
+- **Quotes stay in the original language**, verbatim, inside straight double quotes, so
+  `verify-quotes` can hold them to the transcript. Put the translation right after, in italics
+  and outside the quotes: `> "No hay zombies en la escuela." *(There are no zombies at school.)* — [04:12](…)`.
+  Never put a translation inside quotation marks; never translate inside a blockquote's quotes.
+- Section titles, the point, the meat, decisions: translate freely, they are your words.
+- The user wants to read the whole talk, not notes: write `translation.md` section by section
+  from `chunks.jsonl`, keeping the `## n. [start–end] Title` structure and a `[mm:ss]` marker
+  per paragraph, with a first line saying it is a translation and quotes cannot be verified
+  against it. For a long talk, offer `captions-md <folder> --write` first: YouTube's English
+  captions as timestamped markdown, no model involved, seconds instead of a long pass.
 
 ## 3b. Meeting mode
 
@@ -131,8 +150,8 @@ automatically and numbered, not named, unless the user supplies names.
 verify-quotes <folder>/cliffnotes.md
 ```
 
-It checks every double-quoted span of 4+ words against the transcript, every `[mm:ss]` and
-`&t=` against the video length, that a quote's timestamp is within 20 s of where it was said,
+It checks every double-quoted span of 4+ words against the transcript (in whatever language;
+accents and guillemets are normalised), every `[mm:ss]` and `&t=` against the video length, that a quote's timestamp is within 20 s of where it was said,
 that `[mm:ss]` and `t=` on the same line agree, and that links point at the right video.
 For each FAIL it prints what to do (the real time, or the closest wording it found). Fix the
 line or drop it, rerun, and only report the notes when it exits 0. Paste the final summary line
