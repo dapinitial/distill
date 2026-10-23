@@ -103,14 +103,14 @@ check("suspect isolated low-confidence intro dropped, [Music] dropped, punctuati
       (text(words), [d["text"] for d in dropped]), ("Real speech starts.", ["Credits here"]))
 
 credit = {"transcription": [
-    {"text": " Revisor: Claudia Sander", "tokens": [{"text": " Revisor", "id": 1, "p": 0.4, "offsets": {"from": 190, "to": 2650}},
+    {"text": " Revisor: Nombre Apellido", "tokens": [{"text": " Revisor", "id": 1, "p": 0.4, "offsets": {"from": 190, "to": 2650}},
                                                    {"text": ":", "id": 2, "p": 0.9, "offsets": {"from": 2650, "to": 2650}},
-                                                   {"text": " Claudia", "id": 3, "p": 0.65, "offsets": {"from": 2650, "to": 4980}},
-                                                   {"text": " Sander", "id": 4, "p": 0.9, "offsets": {"from": 4980, "to": 7000}}]},
+                                                   {"text": " Nombre", "id": 3, "p": 0.65, "offsets": {"from": 2650, "to": 4980}},
+                                                   {"text": " Apellido", "id": 4, "p": 0.9, "offsets": {"from": 4980, "to": 7000}}]},
     fake["transcription"][1]]}
 credit["transcription"][1]["tokens"][1]["offsets"] = {"from": 21000, "to": 21300}
 words, dropped, _mid = T["words_from_whisper"](credit)
-check("confident subtitle credit on the silent intro is dropped", [d["text"] for d in dropped], ["Revisor: Claudia Sander"])
+check("confident subtitle credit on the silent intro is dropped", [d["text"] for d in dropped], ["Revisor: Nombre Apellido"])
 
 # --- sentences and sections -------------------------------------------------------------------
 sents = T["sentences"](W("One two. Three four? Five six"))

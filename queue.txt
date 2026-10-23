@@ -1,1 +1,1 @@
-# distill queue: one URL, playlist or file path per line
+# distill queue: one URL, playlist or file path per line (flags allowed after the URL)

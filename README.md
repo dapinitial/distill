@@ -128,3 +128,7 @@ Speakers are detected locally (pyannote segmentation + TitaNet embeddings via sh
 ## Limits
 
 Word times are Whisper's token offsets, accurate to about a second. Japanese and Chinese have no spaces, so they get one "word" per Whisper segment. Speaker detection is not run unless you ask for it.
+
+## License
+
+MIT. The models it downloads (whisper.cpp ggml, pyannote, TitaNet) carry their own licenses.
