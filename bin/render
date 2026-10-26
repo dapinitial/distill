@@ -150,49 +150,93 @@ def slug_id(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-") or "section"
 
 
-def transcript_html(md: str, url_base: str | None, hours: bool, frames: dict[int, str] | None = None) -> tuple[str, list[dict]]:
-    """Sections and paragraphs from transcript.md. Returns (html, paragraph starts)."""
-    out: list[str] = []
+PAGE_WORDS = 2500   # a page of transcript is about this long; talks under PAGE_MIN words stay one page
+PAGE_MIN = 4000
+
+
+def transcript_html(md: str, url_base: str | None, hours: bool, frames: dict[int, str] | None = None) -> tuple[str, list[dict], dict[str, int]]:
+    """Sections and paragraphs from transcript.md, grouped into pages for long talks.
+    Returns (html, paragraph starts, section number -> page index)."""
+    secs: list[dict] = []
     paras: list[dict] = []
-    open_sec = False
     for line in md.splitlines():
         if m := re.match(rf"^## (\d+)\. \[({TS})[-–]({TS})\]\s*(.*)$", line):
-            if open_sec:
-                out.append("</section>")
             n, a, b, ttl = m.group(1), m.group(2), m.group(3), m.group(4).strip()
             ttl_html = f' <span class="ttl">{esc(ttl)}</span>' if ttl else ""
-            out.append(f'<section id="s-{n}"><h3><span class="n">{n}</span> {ts_anchor(a, parse_hms(a), url_base)} – '
-                       f'{ts_anchor(b, parse_hms(b), url_base)}{ttl_html} <span class="dur">{hms(parse_hms(b) - parse_hms(a))}</span></h3>')
+            out = [f'<section id="s-{n}"><h3><span class="n">{n}</span> {ts_anchor(a, parse_hms(a), url_base)} – '
+                   f'{ts_anchor(b, parse_hms(b), url_base)}{ttl_html} <span class="dur">{hms(parse_hms(b) - parse_hms(a))}</span></h3>']
             fr = (frames or {}).get(int(parse_hms(a)))
             if fr:
                 out.append(f'<a class="frame" data-t="{int(parse_hms(a))}" href="{esc((url_base + "&t=" + str(int(parse_hms(a)))) if url_base else "#t-" + str(int(parse_hms(a))))}"'
                            f'{" target=_blank rel=noopener" if url_base else ""}><img src="{fr}" alt="frame at {esc(a)}" loading="lazy"></a>')
-            open_sec = True
+            secs.append({"n": n, "html": out, "words": 0})
         elif m := re.match(rf"^\[({TS})\] (?:\*\*(Speaker \d+):\*\* )?(.*)$", line):
             t = parse_hms(m.group(1))
             paras.append({"t": t})
             spk = f'<b class="spk">{esc(m.group(2))}</b> ' if m.group(2) else ""
-            out.append(f'<p class="para" id="t-{int(t)}" data-t="{int(t)}">{ts_anchor(m.group(1), t, url_base)} '
-                       f'{spk}<span class="txt">{esc(m.group(3))}</span></p>')
-    if open_sec:
-        out.append("</section>")
-    return "\n".join(out), paras
+            if not secs:
+                secs.append({"n": "0", "html": ["<section>"], "words": 0})
+            secs[-1]["html"].append(f'<p class="para" id="t-{int(t)}" data-t="{int(t)}">{ts_anchor(m.group(1), t, url_base)} '
+                                    f'{spk}<span class="txt">{esc(m.group(3))}</span></p>')
+            secs[-1]["words"] += len(m.group(3).split())
+    total = sum(x["words"] for x in secs)
+    pages = max(2, round(total / PAGE_WORDS)) if total > PAGE_MIN and len(secs) > 1 else 1
+    pages = min(pages, len(secs))
+    # Each section goes to the page its midpoint falls on, so pages come out near equal and a section is never split.
+    page_of: dict[str, int] = {}
+    before = 0
+    for x in secs:
+        page_of[x["n"]] = min(pages - 1, int((before + x["words"] / 2) / total * pages)) if pages > 1 else 0
+        before += x["words"]
+    if pages == 1:
+        return "\n".join("\n".join(x["html"]) + "\n</section>" for x in secs), paras, {}
+    out: list[str] = []
+    for k in range(pages):
+        group = [x for x in secs if page_of[x["n"]] == k]
+        out.append(f'<div class="page" id="p-{k + 1}" data-w="{sum(x["words"] for x in group)}"{"" if k == 0 else " hidden"}>')
+        out.extend("\n".join(x["html"]) + "\n</section>" for x in group)
+        out.append("</div>")
+    return "\n".join(out), paras, page_of
 
 
-def jump_html(md: str) -> str:
+def jump_html(md: str, page_of: dict[str, int] | None = None) -> str:
     """The section jump list: a dropdown in the sticky toolbar showing the current section."""
     secs = [m.groups() for m in re.finditer(rf"^## (\d+)\. \[({TS})[-–]({TS})\]\s*(.*)$", md, re.M)]
     if len(secs) < 2:
         return ""
     items = []
+    last = 0
     for n, a, _b, ttl in secs:
         label = esc(ttl.strip()) or f"Section {n}"
-        items.append(f'<li><a href="#s-{n}" data-s="{n}"><span class="jn">{n}</span><span class="jl">{label}</span>'
+        pg = (page_of or {}).get(n, 0)
+        head = f'<li class="pg-head">Page {pg + 1}</li>' if page_of and (pg != last or n == secs[0][0]) else ""
+        last = pg
+        items.append(f'{head}<li><a href="#s-{n}" data-s="{n}"><span class="jn">{n}</span><span class="jl">{label}</span>'
                      f'<span class="jt">{esc(a)}</span></a></li>')
     n0, a0, _, t0 = secs[0]
     return (f'<details class="jump" id="jump"><summary title="Jump to a section">'
             f'<span class="jn" id="jump-n">{n0}</span><span class="jl" id="jump-l">{esc(t0.strip()) or "Section " + n0}</span>'
             f'<span class="jt">of {len(secs)}</span></summary><ol>{"".join(items)}</ol></details>')
+
+
+def pager_html(md: str, page_of: dict[str, int]) -> tuple[str, str]:
+    """Page controls for a paged transcript: a compact one for the toolbar, a fuller one under the page."""
+    if not page_of:
+        return "", ""
+    pages = max(page_of.values()) + 1
+    firsts = {}
+    for m in re.finditer(rf"^## (\d+)\. \[({TS})[-–]({TS})\]\s*(.*)$", md, re.M):
+        firsts.setdefault(page_of.get(m.group(1), 0), (m.group(1), m.group(4).strip()))
+    data = json.dumps({str(k): f"{n} · {t}" if t else f"Section {n}" for k, (n, t) in firsts.items()}, ensure_ascii=False)
+    top = (f'<span class="pages" id="pages" data-n="{pages}" data-first=\'{esc(data)}\'>'
+           f'<button type="button" data-go="-1" aria-label="Previous page">‹</button>'
+           f'<span class="pg-now" id="pg-now">Page 1 of {pages}</span>'
+           f'<button type="button" data-go="1" aria-label="Next page">›</button></span>')
+    bottom = (f'<nav class="pager" id="pager" aria-label="Transcript pages">'
+              f'<button type="button" data-go="-1" id="pg-prev"></button>'
+              f'<span class="pg-dots" id="pg-dots">{"".join(f"<button type=button data-page={k + 1} aria-label=\"Page {k + 1}\"></button>" for k in range(pages))}</span>'
+              f'<button type="button" data-go="1" id="pg-next" class="primary"></button></nav>')
+    return top, bottom
 
 
 CSS = """
@@ -239,7 +283,7 @@ button.primary { background: var(--accent); color: var(--accent-ink); border-col
 button:focus-visible, a:focus-visible, input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px }
 .count { font-size: .85rem; color: var(--muted); font-variant-numeric: tabular-nums }
 .transcript { min-width: 0 }
-.transcript section { padding-block: 14px 6px; scroll-margin-top: 72px }
+.transcript section { padding-block: 14px 6px; scroll-margin-top: calc(var(--toolbar, 64px) + 8px) }
 /* Section jump list: lives in the sticky toolbar, names the section in view, opens into every section. */
 .jump { position: relative; flex: 0 1 auto; min-width: 0; max-width: 100% }
 .jump summary { list-style: none; cursor: pointer; display: flex; align-items: center; gap: 8px; font-size: .85rem; padding: 6px 10px;
@@ -284,6 +328,19 @@ mark { background: var(--mark); color: inherit; border-radius: 2px; padding: 0 1
 .end { margin: 24px 0 8px; padding: 14px 12px; border-top: 1px solid var(--line); color: var(--muted); font-size: .9rem; display: flex; flex-wrap: wrap; gap: 6px 18px; align-items: baseline }
 .library { font-size: .85rem } .notes .library { display: block; margin-top: 4px }
 #resume { display: none } #resume.show { display: inline-block }
+/* Pages: long talks read a page at a time (about 2,500 words); search shows every page at once. */
+.pages { display: inline-flex; align-items: center; gap: 2px; font-size: .85rem; color: var(--muted); flex: none }
+.pages button { padding: 4px 9px; font-size: 1rem; line-height: 1 } .pages button:disabled { opacity: .35; cursor: default }
+.pg-now { padding: 0 6px; font-variant-numeric: tabular-nums; white-space: nowrap }
+.pager { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; margin: 20px 0 0; padding: 16px 0 4px; border-top: 1px solid var(--line) }
+.pager > button { max-width: min(100%, 22rem); text-align: left; padding: 9px 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap }
+.pager > button[hidden] { display: none } .pager #pg-next { margin-left: auto; text-align: right }
+.pg-dots { display: flex; gap: 6px; order: 3; width: 100%; justify-content: center }
+.pg-dots button { width: 10px; height: 10px; padding: 0; border-radius: 50%; border: 1px solid var(--accent); background: transparent }
+.pg-dots button[aria-current="true"] { background: var(--accent) }
+.searching .pager, .searching .pages { display: none }
+.jump li.pg-head { font: 600 .7rem/1 var(--body); letter-spacing: .08em; text-transform: uppercase; color: var(--muted); padding: 10px 8px 4px }
+.jump li.pg-head:first-child { padding-top: 4px }
 @media (max-width: 900px) {
   .wrap { grid-template-columns: 1fr; gap: 0 }
   .notes { position: static; max-height: none; border-bottom: 1px solid var(--line) }
@@ -300,6 +357,45 @@ JS = r"""
   var player = null, playerKind = null, follow = document.getElementById('follow');
   var toast = document.getElementById('toast'); var toastTimer;
   function say(msg) { toast.textContent = msg; toast.classList.add('show'); clearTimeout(toastTimer); toastTimer = setTimeout(function () { toast.classList.remove('show'); }, 1600); }
+  var slice = function (x) { return Array.prototype.slice.call(x); };
+  // Sections land just below the sticky toolbar, whose height changes as it wraps.
+  var toolbar = document.querySelector('.toolbar');
+  function measureToolbar() { if (toolbar) document.documentElement.style.setProperty('--toolbar', toolbar.offsetHeight + 'px'); }
+  measureToolbar(); window.addEventListener('resize', measureToolbar);
+
+  // Pages: a long talk shows one page of sections at a time. reveal(el) turns to the page holding el.
+  var pageEls = slice(document.querySelectorAll('.transcript .page')), curPage = 0, searching = false;
+  var pageWords = pageEls.map(function (p) { return +p.dataset.w || 1; });
+  var pageBefore = pageWords.map(function (_, k) { return pageWords.slice(0, k).reduce(function (a, b) { return a + b; }, 0); });
+  var totalWords = pageWords.reduce(function (a, b) { return a + b; }, 0);
+  var pagesBox = document.getElementById('pages'), firsts = {};
+  try { firsts = JSON.parse(pagesBox.dataset.first); } catch (_) {}
+  function paged() { return pageEls.length > 1 && !searching; }
+  function layoutPages() {
+    pageEls.forEach(function (p, k) { p.hidden = !searching && k !== curPage; });
+    var last = pageEls.length - 1, end = document.getElementById('end');
+    if (end) end.hidden = paged() && curPage < last;
+    if (!pageEls.length) return;
+    document.getElementById('pg-now').textContent = 'Page ' + (curPage + 1) + ' of ' + pageEls.length;
+    slice(pagesBox.querySelectorAll('[data-go]')).forEach(function (b) { var k = curPage + +b.dataset.go; b.disabled = k < 0 || k > last; });
+    var prev = document.getElementById('pg-prev'), next = document.getElementById('pg-next');
+    prev.hidden = curPage === 0; prev.textContent = '‹ Page ' + curPage;
+    next.hidden = curPage === last; next.textContent = 'Page ' + (curPage + 2) + ': ' + (firsts[curPage + 1] || '') + ' ›';
+    slice(document.querySelectorAll('#pg-dots button')).forEach(function (b, k) { if (k === curPage) b.setAttribute('aria-current', 'true'); else b.removeAttribute('aria-current'); });
+  }
+  function showPage(k, toTop) {
+    k = Math.max(0, Math.min(pageEls.length - 1, k));
+    var changed = k !== curPage; curPage = k; layoutPages();
+    if (toTop) { var top = document.querySelector('.transcript').getBoundingClientRect().top + window.scrollY; if (window.scrollY > top) window.scrollTo(0, top); }
+    if (changed || toTop) window.dispatchEvent(new Event('scroll'));
+  }
+  function reveal(el) { var pg = el && el.closest ? el.closest('.page') : null, k = pageEls.indexOf(pg); if (k >= 0 && k !== curPage && !searching) showPage(k, false); }
+  document.addEventListener('click', function (e) {
+    var b = e.target.closest && e.target.closest('#pages [data-go], #pager [data-go], #pg-dots [data-page]'); if (!b) return;
+    showPage(b.dataset.page ? +b.dataset.page - 1 : curPage + +b.dataset.go, true);
+  });
+  if (pageEls.length) layoutPages();
+
   function fmt(s) { s = Math.round(s); var h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60), x = s % 60; var mm = (h ? String(m).padStart(2, '0') : String(m).padStart(2, '0')) + ':' + String(x).padStart(2, '0'); return h ? h + ':' + mm : mm; }
 
   // Player: YouTube iframe via postMessage (no external script), or a local <audio>.
@@ -323,7 +419,7 @@ JS = r"""
     var i = idxFor(t); if (i === lastIdx && !force) return;
     if (lastIdx >= 0) paras[lastIdx].classList.remove('now');
     lastIdx = i; if (i < 0) return; paras[i].classList.add('now');
-    if (follow && follow.checked || force) paras[i].scrollIntoView({block: 'center', behavior: 'smooth'});
+    if (follow && follow.checked || force) { reveal(paras[i]); paras[i].scrollIntoView({block: 'center', behavior: 'smooth'}); }
   }
   function tick(t) { light(t, false); }
 
@@ -334,9 +430,10 @@ JS = r"""
     if (player) { e.preventDefault(); seek(t); }
     else if (a.getAttribute('href').charAt(0) === '#') { e.preventDefault(); var el = document.getElementById('t-' + t) || paras[Math.max(0, idxFor(t))]; if (el) { light(t, true); el.scrollIntoView({block: 'center'}); } }
   });
-  // Deep link: #t-305 or #s-3
+  // Deep link: #t-305, #s-3 or #p-2
   var h = location.hash.slice(1), m = /^t-(\d+)$/.exec(h);
   if (m) { setTimeout(function () { light(+m[1], true); }, 50); }
+  else if (/^[sp]-\d+$/.test(h) && document.getElementById(h)) { setTimeout(function () { var el = document.getElementById(h); if (h.charAt(0) === 'p') showPage(pageEls.indexOf(el), false); else reveal(el); el.scrollIntoView({block: 'start'}); }, 50); }
 
   // Search: hide paragraphs without a hit, mark the hits.
   var q = document.getElementById('q'), count = document.getElementById('count');
@@ -345,6 +442,7 @@ JS = r"""
   function escRe(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
   function search() {
     var v = q.value.trim(), re = v.length > 1 ? new RegExp(escRe(v), 'ig') : null, n = 0;
+    if (!!re !== searching) { searching = !!re; document.body.classList.toggle('searching', searching); if (pageEls.length) layoutPages(); }
     texts.forEach(function (s, i) {
       var hit = re && re.test(originals[i]); re && (re.lastIndex = 0);
       paras[i].hidden = !!re && !hit; paras[i].classList.toggle('hit', !!hit);
@@ -385,7 +483,9 @@ JS = r"""
     save.textContent = 'Save progress to the library (' + best + '%) ↗';
   }
   function onScroll() {
-    var h = pageHeight(); pct = h > 0 ? Math.max(0, Math.min(100, Math.round(window.scrollY / h * 100))) : 100;
+    var h = pageHeight(), frac = h > 0 ? Math.max(0, Math.min(1, window.scrollY / h)) : 1;
+    // On a paged talk the ring counts words: pages already behind you, plus how far into this one.
+    pct = Math.round((paged() ? (pageBefore[curPage] + frac * pageWords[curPage]) / totalWords : frac) * 100);
     if (ring) { var shown = window.scrollY > 50; ring.classList.toggle('visible', shown); ring.tabIndex = shown ? 0 : -1;
       bar.style.strokeDashoffset = plen - plen * pct / 100; ring.title = pct + '% read'; ring.setAttribute('aria-label', pct + '% read. Back to top'); }
     if (pct > best) { best = pct; try { localStorage.setItem(KEY, String(best)); } catch (_) {} links(); }
@@ -393,7 +493,10 @@ JS = r"""
   window.addEventListener('scroll', onScroll, {passive: true});
   if (ring) ring.addEventListener('click', function () { window.scrollTo({top: 0, behavior: 'smooth'}); });
   if (resume && best >= 5 && best < 95) { resume.textContent = 'Resume at ' + best + '%'; resume.classList.add('show');
-    resume.addEventListener('click', function () { window.scrollTo({top: pageHeight() * best / 100, behavior: 'smooth'}); resume.classList.remove('show'); }); }
+    resume.addEventListener('click', function () {
+      var frac = best / 100;
+      if (paged()) { var w = frac * totalWords, k = 0; while (k + 1 < pageEls.length && pageBefore[k + 1] <= w) k++; showPage(k, false); frac = (w - pageBefore[k]) / pageWords[k]; }
+      window.scrollTo({top: pageHeight() * frac, behavior: 'smooth'}); resume.classList.remove('show'); }); }
   links(); onScroll();
 
   // Section jump list: name the section in view, jump on click, close on pick / Escape / outside click.
@@ -404,8 +507,9 @@ JS = r"""
     var jn = document.getElementById('jump-n'), jl = document.getElementById('jump-l');
     var bar = document.querySelector('.toolbar'), cur = -1, pending = false;
     function current() {
-      var edge = (bar ? bar.getBoundingClientRect().bottom : 0) + 12, i = 0;
-      for (var k = 0; k < secs.length; k++) { if (!secs[k].hidden && secs[k].getBoundingClientRect().top <= edge) i = k; }
+      var edge = (bar ? bar.getBoundingClientRect().bottom : 0) + 12, i = -1;
+      for (var k = 0; k < secs.length; k++) { if (secs[k].offsetParent === null) continue; if (i < 0 || secs[k].getBoundingClientRect().top <= edge) i = k; }
+      if (i < 0) i = 0;
       if (i === cur) return; cur = i;
       jlinks.forEach(function (a, k) { if (k === i) a.setAttribute('aria-current', 'true'); else a.removeAttribute('aria-current'); });
       var a = jlinks[i]; if (!a) return;
@@ -415,7 +519,7 @@ JS = r"""
     jump.addEventListener('click', function (e) {
       var a = e.target.closest && e.target.closest('ol a'); if (!a) return;
       e.preventDefault(); jump.open = false;
-      var s = document.getElementById('s-' + a.dataset.s); if (s) s.scrollIntoView({block: 'start', behavior: 'smooth'});
+      var s = document.getElementById('s-' + a.dataset.s); if (s) { reveal(s); s.scrollIntoView({block: 'start', behavior: 'smooth'}); }
     });
     jump.addEventListener('toggle', function () { if (jump.open) { var a = jlinks[cur]; if (a) a.scrollIntoView({block: 'nearest'}); } });
     document.addEventListener('keydown', function (e) { if (e.key === 'Escape' && jump.open) { jump.open = false; jump.querySelector('summary').focus(); } });
@@ -464,7 +568,8 @@ def main() -> None:
         sec_starts = [parse_hms(m.group(1)) for m in re.finditer(rf"^## \d+\. \[({TS})", transcript_md, re.M)]
         ww = [parse_hms(m.group(1)) for m in re.finditer(rf"^- \[({TS})[-\u2013]", notes_md[notes_md.find("## Worth watching"):notes_md.find("## Safe to skip")] if "## Worth watching" in notes_md else "", re.M)]
         frames = grab_frames(vid_file, folder, sec_starts + ww)
-    t_html, paras = transcript_html(transcript_md, url_base, hours, frames)
+    t_html, paras, page_of = transcript_html(transcript_md, url_base, hours, frames)
+    pager_top, pager_bottom = pager_html(transcript_md, page_of)
 
     if frames and "Worth watching" in notes_html:
         def add_thumb(m):
@@ -507,7 +612,7 @@ def main() -> None:
         mark_read = f'<a class="library" href="{esc(toc_url)}#read-{esc(slug)}" target="_blank" rel="noopener">Mark as read in the library ↗</a>'
     else:
         mark_read = ""
-    end_html = f'<footer class="end"><span>End of the transcript.</span>{mark_read}</footer>'
+    end_html = f'<footer class="end" id="end"><span>End of the transcript.</span>{mark_read}</footer>'
     ring_html = ('<button class="ring" id="ring" type="button" tabindex="-1" aria-label="Back to top">'
                  '<svg class="circle" viewBox="-1 -1 102 102" aria-hidden="true"><path class="track" d="M50,1 a49,49 0 0,1 0,98 a49,49 0 0,1 0,-98"/>'
                  '<path class="bar" d="M50,1 a49,49 0 0,1 0,98 a49,49 0 0,1 0,-98"/></svg>'
@@ -532,7 +637,8 @@ def main() -> None:
   </aside>
   <main class="transcript">
     <div class="toolbar">
-      {jump_html(transcript_md)}
+      {jump_html(transcript_md, page_of)}
+      {pager_top}
       <input type="search" id="q" placeholder="Search the transcript" aria-label="Search the transcript">
       <span class="count" id="count"></span>
       {follow_html}
@@ -540,6 +646,7 @@ def main() -> None:
       <button class="primary" id="copy-sel" title="Copy the selected text as a quote with its timestamp, ready to paste into Claude Code">Copy selection for Claude</button>
     </div>
     {t_html}
+    {pager_bottom}
     {end_html}
   </main>
 </div>

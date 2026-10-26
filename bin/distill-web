@@ -178,6 +178,9 @@ ol.lib .meta {{ font-size: .8rem; color: var(--muted) }} ol.lib p {{ margin: 6px
 
 class Handler(http.server.SimpleHTTPRequestHandler):
     publish = True
+    # The pages are fragments without a <meta charset>, so the header has to say UTF-8.
+    extensions_map = {**http.server.SimpleHTTPRequestHandler.extensions_map, ".html": "text/html; charset=utf-8",
+                      ".json": "application/json; charset=utf-8", ".md": "text/markdown; charset=utf-8"}
 
     def end_headers(self):
         self.send_header("Access-Control-Allow-Origin", "*")

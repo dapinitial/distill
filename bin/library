@@ -267,6 +267,10 @@ def serve(root: Path, port: int) -> None:
     import functools
 
     class H(http.server.SimpleHTTPRequestHandler):
+        # The pages are fragments without a <meta charset>, so the header has to say UTF-8.
+        extensions_map = {**http.server.SimpleHTTPRequestHandler.extensions_map, ".html": "text/html; charset=utf-8",
+                          ".json": "application/json; charset=utf-8", ".md": "text/markdown; charset=utf-8"}
+
         def end_headers(self):
             self.send_header("Access-Control-Allow-Origin", "*")
             self.send_header("Cache-Control", "no-store")

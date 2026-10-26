@@ -89,7 +89,7 @@ Each transcript folder holds:
 | `ask` | which talks say something about a question, ranked across the library (BM25 over the sections, no model), as markdown with timestamp links ready for Claude Code |
 | `distill-web` | a small server on the Mac: paste a link, it is queued and distilled, read the library; reach it from a phone over Tailscale |
 | `stamp` | turn `7:49` or `469` into the `[07:49](…&t=469)` marker |
-| `render` | one self-contained HTML page per transcript: notes beside the transcript, search, timestamp links, frame grabs when the video is present. `--open` adds an embedded player (YouTube or the local audio) that seeks from any timestamp and highlights the paragraph being spoken |
+| `render` | one self-contained HTML page per transcript: notes beside the transcript, search, timestamp links, a section jump list, frame grabs when the video is present. Talks over 4,000 words read a page at a time (about 2,500 words, never splitting a section); search covers every page, and `#s-N`, `#t-N` and `#p-N` links open the right page. `--open` adds an embedded player (YouTube or the local audio) that seeks from any timestamp and highlights the paragraph being spoken |
 | `library` | `out/index.md` and `out/index.html` (every transcript with its date, length, the point, and links), plus `toc.html` and `library.json` for publishing and fetching; `--serve` puts them on localhost |
 | `glossary-suggest` | three deterministic signals for misheard names: spelling clusters, disagreements with YouTube's captions, low-confidence words |
 | `captions-md` | a captions track as timestamped markdown; the no-model way to read a foreign-language talk in English |
