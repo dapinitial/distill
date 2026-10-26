@@ -9,6 +9,17 @@ Two Claude Code skills that chain:
 
 Transcription and cleanup run on this Mac. The only thing that leaves it is the rendered page, if you choose to publish it as a private Claude Artifact.
 
+## What it does
+
+- **Any talk, in minutes, on your own machine.** A YouTube link, a playlist, a channel or a file on disk becomes a transcript with every word timed, then a page you can read in five minutes. An hour of video takes a few minutes on Apple Silicon. Nothing is uploaded to transcribe it.
+- **Notes you can check.** Every quote in the notes is the speaker's exact words, proved against the transcript by a script before the page is built, and every timestamp jumps to that moment in the video. If a quote is off by a word, the page does not get made.
+- **The whole talk, not just the summary.** The page puts the notes beside the full transcript: search, a section jump list, an embedded player that follows along, frame grabs when the video was kept, and long talks split into pages of about ten minutes' reading.
+- **Claims flagged for a person to judge.** On request, the agent scans a talk for checkable claims (numbers, facts, causes, predictions), looks for sources, and suggests whether each one holds up, is disputed, is contradicted, is out of date, or couldn't be checked. The page lists them questionable first, and you make every call. See [Checking claims](#checking-claims).
+- **Meetings as well as talks.** With speaker labels, a recording becomes decisions, action items and open questions instead of cliff notes.
+- **Other languages.** Whisper hears the original; the notes come out in English with every quote kept in the original language beside its translation.
+- **A library that grows.** Every talk lands in one index. `ask` finds which talks cover a question, `where` finds when a phrase was said, and the MCP server hands the whole library to Claude Desktop or any other client.
+- **Runs without you.** Put links in a queue, or paste one into `distill-web` from your phone over Tailscale, and the batch transcribes, writes the notes, verifies them and renders the pages unattended.
+
 ## Setup
 
 ```bash
@@ -167,6 +178,42 @@ server, where `ask` is also a tool.
 ## Other languages
 
 `--lang auto` lets Whisper identify the language (about a second), and the rest of the pipeline follows: the punctuated prompt is given in that language, the filler and doubled-word tables switch (English, Spanish, French, German, Italian, Portuguese and Dutch have tables; anything else gets no filler removal rather than a wrong one), and the captions fetched are the spoken language's plus YouTube's English track. Translation happens in the cliffnotes step, because it is an LLM job: the notes come out in English (or whatever you ask for), while every quote stays in the original language, verbatim and verified, with the translation beside it in italics. `captions-md` turns the English captions into a timestamped read of the whole talk without any model. Whisper's own translate mode is not used: large-v3-turbo was fine-tuned for transcription only and returns the source language when asked to translate.
+
+## Checking claims
+
+Ask for it in Claude Code ("check the claims in this talk") and the cliffnotes skill does a second pass:
+
+1. The agent reads the transcript for claims a source could settle: a number, a fact, a cause, a prediction. Opinions and jokes are left alone.
+2. For each one it looks for evidence, preferring the paper, the dataset or the announcement over write-ups about them, and suggests a label: **supported**, **disputed** (credible sources disagree), **contradicted** (the evidence says otherwise), **outdated** (true when said, not now) or **couldn't check**.
+3. It writes `claims.json`: the speaker's exact words, the time they said them, the claim in one line, why it suggests that label, and the sources with what each one says.
+4. `check-claims` holds that file to the same standard as the notes. Every quote has to be verbatim in the transcript within 20 seconds of its timestamp, every label but "couldn't check" needs a source, and no claim may arrive already decided. If anything fails, the panel isn't built.
+5. `render` adds a **Claims to review** panel to the page, contradicted first and supported last. Each claim links to the moment in the video and the paragraph in the transcript. You choose **Agree**, **Disagree** or **Needs a closer look** and can add a note.
+
+Your decisions save to the published page's own storage (publish it with the `db` and `user` capabilities), and the header counts how many you have reviewed. Claude can read them back to fix the notes where you agreed; it never records a decision for you. The local copy shows the panel but keeps the buttons off, since there is nowhere to save.
+
+The labels are suggestions from a web search on the day it ran. A "contradicted" can be a transcription error rather than the speaker's: a number Whisper misheard looks exactly like a wrong number, so listen at the timestamp before you agree.
+
+## Decisions, and why
+
+**Transcribe locally.** Talks and especially meetings are often private, and a cloud transcription service would see all of it. whisper.cpp on Metal is fast enough that the trade costs nothing: an hour of audio in a few minutes, with no account, no per-minute bill and no upload.
+
+**Cleanup is code, not a model.** A model asked to tidy a transcript also rewords it, quietly. Fixed rules (fillers, doubled words, a glossary for names) give the same transcript every time, and that is what lets a script prove the quotes.
+
+**Quotes are proved, not trusted.** Summaries that misquote are the main way this kind of tool goes wrong, and a reader can't tell a real quote from a plausible one. `verify-quotes` and `check-claims` match every quote word for word against the timed transcript and refuse to pass anything that doesn't match. The model writes; the scripts check.
+
+**The person makes the call.** The claims scan is there to surface what deserves a second look, not to rule on what's true. A model with a web search is confidently wrong often enough, and a talk can be mistranscribed, so nothing is marked false and set aside without someone reviewing it. The agent finds and explains; the person decides, and the decision stays theirs.
+
+**Timestamps everywhere.** Every point in the notes links to the moment it was said, so you can always check the notes against the speaker in one click instead of taking them on faith.
+
+**The whole transcript ships with the notes.** A summary chooses what matters; keeping the full text beside it, searchable, means you can disagree with that choice.
+
+**Two skills that chain, and plain scripts underneath.** `/transcribe` is useful on its own, and so is every script in `bin/`. The skills tell Claude what to do; the scripts do the parts that must come out the same every time. The MCP server and `distill-web` shell out to the same scripts, so there is one implementation.
+
+**Pages are single files, published privately.** A rendered page carries everything it needs, so it works from disk, from the local server or as a private Claude Artifact, and it is shared only if you share it.
+
+**The Mac is the server.** Because transcription is local, the machine doing it serves the pages too. `distill-web` binds to localhost or Tailscale only, since it has no login of its own; nothing listens on the open internet.
+
+**No names in the history.** Commits describe what changed, not who said what in which talk. Outputs in `out/` are gitignored.
 
 ## Limits
 
