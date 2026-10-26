@@ -156,6 +156,26 @@ with tempfile.TemporaryDirectory() as d:
     check("verify-quotes: 2 ok, 4 fails (paraphrase, [02:00] and t=120 past the end, mismatch), exit 1",
           (sum(l.startswith("OK") for l in lines), sum(l.startswith("FAIL") for l in lines), r.returncode), (2, 4, 1))
 
+# --- check-claims: the agent's scan is held to the transcript ------------------------------------
+with tempfile.TemporaryDirectory() as d:
+    folder = Path(d)
+    words = W("We vote for politicians with lower voices. It's true. Because we associate depth with power.", gap=1.0)
+    (folder / "transcript.json").write_text(json.dumps({"title": "t", "duration": 60, "words": words, "sections": []}))
+    src = {"url": "https://example.org/paper", "title": "A paper", "says": "Lower voices win more votes."}
+    ok = {"id": "a", "t": 0, "kind": "causal", "quote": "We vote for politicians with lower voices", "claim": "c", "why": "w",
+          "suggest": "supported", "evidence": [src]}
+    claims = [ok,
+              dict(ok, id="b", quote="We vote for the politicians"),                       # paraphrase
+              dict(ok, id="c", t=40),                                                      # wrong time
+              dict(ok, id="d", suggest="disputed", evidence=[]),                           # label without a source
+              dict(ok, id="e", suggest="unverified", evidence=[]),                         # fine: couldn't check
+              dict(ok, id="f", review={"decision": "agree"})]                              # agent may not review
+    (folder / "claims.json").write_text(json.dumps({"claims": claims}))
+    r = subprocess.run([sys.executable, str(HERE / "check-claims"), str(folder)], capture_output=True, text=True)
+    lines = r.stdout.splitlines()
+    check("check-claims: 4 quotes ok (a, d, e, f), 4 fails (paraphrase, wrong time, label without source, agent review), exit 1",
+          (sum(l.startswith("OK") for l in lines), sum(l.startswith("FAIL") for l in lines), r.returncode), (4, 4, 1))
+
 # --- ask: ranking across a small library -----------------------------------------------------
 with tempfile.TemporaryDirectory() as tmp:
     root = Path(tmp)

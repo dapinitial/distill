@@ -1,0 +1,107 @@
+#!/usr/bin/env python3
+"""check-claims: hold a claims.json (the agent's fact-check scan of a talk) to the same rules as the notes.
+
+  check-claims <claims.json | transcript folder> [--tolerance 20]
+
+The agent finds checkable claims, gathers evidence and suggests a label; a person reviews every
+claim and makes the call. This script makes sure the agent's half is honest before anyone sees it:
+
+  * every claim's "quote" appears word for word in transcript.json, near its "t" (seconds)
+  * "suggest" is one of: supported, disputed, contradicted, outdated, unverified
+  * every label but "unverified" cites at least one source: an https url, a title and what it says
+  * ids are unique, "kind" is one of: number, fact, causal, prediction
+  * nothing is marked reviewed here: decisions belong to the person, on the page
+Exit 0 when nothing failed. Prints OK / FAIL lines; FAIL lines say what to fix.
+"""
+from __future__ import annotations
+
+import argparse
+import importlib.machinery
+import importlib.util
+import json
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from distill_common import find_transcript_dir, hms, load_transcript, norm_tokens  # noqa: E402
+
+_loader = importlib.machinery.SourceFileLoader("verify_quotes", str(Path(__file__).resolve().parent / "verify-quotes"))
+_spec = importlib.util.spec_from_loader("verify_quotes", _loader)
+vq = importlib.util.module_from_spec(_spec)
+_loader.exec_module(vq)
+
+LABELS = ("supported", "disputed", "contradicted", "outdated", "unverified")
+KINDS = ("number", "fact", "causal", "prediction")
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("target", help="claims.json, or a transcript folder containing it")
+    ap.add_argument("--tolerance", type=float, default=20, help="seconds a claim's t may be off")
+    a = ap.parse_args()
+    target = Path(a.target).expanduser()
+    path = target / "claims.json" if target.is_dir() else target
+    if not path.exists():
+        sys.exit(f"check-claims: {path} not found")
+    data = load_transcript(find_transcript_dir(path.parent))
+    hay: list[str] = []
+    starts: list[float] = []
+    for w in data["words"]:
+        for t in norm_tokens(w["word"]):
+            hay.append(t)
+            starts.append(w["start"])
+
+    fails = oks = 0
+
+    def out(kind: str, msg: str) -> None:
+        nonlocal fails, oks
+        fails += kind == "FAIL"
+        oks += kind == "OK"
+        print(f"{kind}  {msg}")
+
+    try:
+        doc = json.loads(path.read_text())
+    except ValueError as e:
+        sys.exit(f"check-claims: {path} is not JSON: {e}")
+    claims = doc.get("claims") or []
+    if not claims:
+        out("FAIL", "no claims in the file")
+    seen: set[str] = set()
+    for c in claims:
+        cid = str(c.get("id") or "?")
+        if cid in seen:
+            out("FAIL", f"{cid}: duplicate id")
+        seen.add(cid)
+        if "review" in c:
+            out("FAIL", f"{cid}: has a review; reviews come from the person on the page, not from the agent")
+        if c.get("suggest") not in LABELS:
+            out("FAIL", f"{cid}: suggest must be one of {', '.join(LABELS)}")
+        if c.get("kind") not in KINDS:
+            out("FAIL", f"{cid}: kind must be one of {', '.join(KINDS)}")
+        if not (c.get("claim") or "").strip() or not (c.get("why") or "").strip():
+            out("FAIL", f"{cid}: needs a one-line claim and a why")
+        ev = c.get("evidence") or []
+        if c.get("suggest") != "unverified" and not ev:
+            out("FAIL", f"{cid}: a '{c.get('suggest')}' label needs at least one source")
+        for e in ev:
+            if not str(e.get("url", "")).startswith("https://") or not e.get("title") or not e.get("says"):
+                out("FAIL", f"{cid}: every source needs an https url, a title and what it says")
+        q = norm_tokens(c.get("quote") or "")
+        t = float(c.get("t") or 0)
+        if len(q) < 4:
+            out("FAIL", f"{cid}: quote must be at least 4 words of the transcript")
+            continue
+        at = vq.find_quote(hay, [q], [t], starts)
+        if at is None:
+            r, i = vq.closest(hay, q, t, starts)
+            out("FAIL", f"{cid}: quote not in the transcript (closest {r:.0%} at {hms(starts[i])})")
+        elif abs(starts[at] - t) > a.tolerance:
+            out("FAIL", f"{cid}: quote is spoken at {hms(starts[at])}, t says {hms(t)}")
+        else:
+            out("OK", f"{cid} [{hms(starts[at])}] {c.get('suggest')}: {c.get('claim')}")
+    print(f"\n{oks} ok, {fails} failed")
+    sys.exit(1 if fails else 0)
+
+
+if __name__ == "__main__":
+    main()

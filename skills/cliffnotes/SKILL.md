@@ -190,6 +190,36 @@ published table of contents lists the new pages; otherwise publish it once (icon
 "Save progress" and "Mark as read" links back to it, so render and publish the table of contents
 before the pages when both are new.
 
+## 5a. Check claims (on request)
+
+When the user asks to check, validate or fact-check a talk, scan it for claims a person should
+look at. This is a partnership: you find checkable claims, gather evidence and suggest a label;
+the person reviews every one on the page and makes the call. Nothing is dismissed, hidden or
+marked settled by you.
+
+1. Read the transcript, not just the notes. Pick claims that can be checked: numbers, dates,
+   named facts, cause and effect, and predictions that have since come due. Skip opinion,
+   analogy, jokes and demos (say so in the claim if you are unsure). Aim for 10 to 20 per hour.
+2. Search the web for each one. Prefer primary sources (the paper, the lab's own post, the
+   official record). Note how old the talk is: a claim that was right then and is wrong now is
+   `outdated`, not `contradicted`.
+3. Write `<folder>/claims.json`:
+   `{"scanned": "<today>", "by": "...", "talk_date": "...", "claims": [{"id", "t", "kind", "quote",
+   "claim", "suggest", "why", "evidence": [{"url", "title", "date"?, "says"}]}]}`.
+   `quote` is the speaker's exact words (4+ words) and `t` the second they are spoken. `suggest`
+   is supported, disputed (partly holds, or good sources disagree), contradicted, outdated, or
+   unverified (no source found; evidence may be empty). `why` says what the evidence shows and
+   what is still uncertain, in plain words. `says` is your summary of the source, not a quote.
+   When the transcript itself may be wrong (a number that does not add up, a misheard name),
+   say so and point the person to the moment to listen.
+4. `check-claims <folder>` must pass: it proves every quote is verbatim and near its `t`, every
+   label but unverified has a source, and no claim carries a review.
+5. `render <folder>` adds a "Claims to review" panel to the notes, questionable first. Publish
+   with `capabilities: {"db": {}, "user": {}}` (keep the page's existing capabilities): the
+   person's decisions (agree, disagree, needs a closer look, plus a note) save to the page's
+   `reviews` collection, one document per claim id. Read them back with ArtifactData (`list`,
+   collection `reviews`) when the user asks what they decided; never write decisions yourself.
+
 ## 6. Show the notes
 
 Unattended runs: `distill-batch` calls this skill headlessly for each queued item and checks the

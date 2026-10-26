@@ -239,6 +239,54 @@ def pager_html(md: str, page_of: dict[str, int]) -> tuple[str, str]:
     return top, bottom
 
 
+CLAIM_ORDER = ("contradicted", "outdated", "disputed", "unverified", "supported")
+CLAIM_NAMES = {"supported": "Supported", "disputed": "Disputed", "contradicted": "Contradicted", "outdated": "Outdated", "unverified": "Couldn't check"}
+
+
+def claims_html(folder: Path, url_base: str | None, para_starts: list[float]) -> str:
+    """The agent's fact-check scan (claims.json, held to the transcript by check-claims) as a review queue.
+    Questionable claims come first; every claim stays listed until a person reviews it, and after."""
+    f = folder / "claims.json"
+    if not f.exists():
+        return ""
+    try:
+        doc = json.loads(f.read_text())
+    except ValueError:
+        return ""
+    claims = sorted(doc.get("claims") or [], key=lambda c: (CLAIM_ORDER.index(c.get("suggest", "unverified")) if c.get("suggest") in CLAIM_ORDER else 9, c.get("t", 0)))
+    if not claims:
+        return ""
+    counts = {k: sum(1 for c in claims if c.get("suggest") == k) for k in CLAIM_ORDER}
+    summary = " · ".join(f"{n} {CLAIM_NAMES[k].lower()}" for k, n in counts.items() if n)
+    items = []
+    for c in claims:
+        t = float(c.get("t") or 0)
+        para = max([p for p in para_starts if p <= t] or [0])
+        srcs = "".join(f'<li><a href="{esc(e["url"])}" target="_blank" rel="noopener">{esc(e.get("title", e["url"]))}</a>'
+                       f'{" <span class=d>" + esc(e["date"]) + "</span>" if e.get("date") else ""}<br>{esc(e.get("says", ""))}</li>'
+                       for e in c.get("evidence") or [])
+        lab = c.get("suggest", "unverified")
+        items.append(
+            f'<li class="claim" id="claim-{esc(c["id"])}" data-id="{esc(c["id"])}" data-suggest="{esc(lab)}">'
+            f'<div class="ch"><span class="lab lab-{esc(lab)}">Agent suggests: {esc(CLAIM_NAMES.get(lab, lab))}</span>'
+            f'{ts_anchor(hms(t), t, url_base)}<a class="goto" href="#t-{int(para)}">in transcript</a></div>'
+            f'<p class="cq">&ldquo;{esc(c.get("quote", ""))}&rdquo;</p>'
+            f'<p class="cc">{esc(c.get("claim", ""))}</p>'
+            f'<p class="cw">{esc(c.get("why", ""))}</p>'
+            f'{"<ul class=src>" + srcs + "</ul>" if srcs else "<p class=cw><em>No source found.</em></p>"}'
+            f'<div class="rv"><span class="rv-l">Your call:</span>'
+            f'<button type="button" data-d="agree">Agree</button><button type="button" data-d="disagree">Disagree</button>'
+            f'<button type="button" data-d="needs-more">Needs a closer look</button>'
+            f'<input type="text" class="rv-note" placeholder="Note (optional)" aria-label="Review note" maxlength="500">'
+            f'<span class="rv-s" aria-live="polite"></span></div></li>')
+    return (f'<h2 id="claims">Claims to review</h2>'
+            f'<p class="claims-intro">The agent scanned the talk for checkable claims and suggests a label for each, with its sources. '
+            f'Nothing is settled until you review it. <span id="claims-n">{len(claims)} claims</span> · {summary}. '
+            f'Checked {esc(doc.get("scanned", ""))}; the talk is from {esc(doc.get("talk_date", "?"))}.</p>'
+            f'<p class="claims-off" id="claims-off">Reviews save on the published page.</p>'
+            f'<ol class="claims">{"".join(items)}</ol>')
+
+
 CSS = """
 <style>
 /* Layout: a reading desk. Notes in a sticky rail on the left, the transcript as the long scroll on the right,
@@ -328,6 +376,29 @@ mark { background: var(--mark); color: inherit; border-radius: 2px; padding: 0 1
 .end { margin: 24px 0 8px; padding: 14px 12px; border-top: 1px solid var(--line); color: var(--muted); font-size: .9rem; display: flex; flex-wrap: wrap; gap: 6px 18px; align-items: baseline }
 .library { font-size: .85rem } .notes .library { display: block; margin-top: 4px }
 #resume { display: none } #resume.show { display: inline-block }
+/* Claims to review: the agent's suggestions, questionable first; the person's call is what counts. */
+:root { --c-supported: #2f7d4a; --c-disputed: #a86a00; --c-contradicted: #b3261e; --c-outdated: #6b4fa8; --c-unverified: #6a7282 }
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --c-supported: #7fd19b; --c-disputed: #f0b85a; --c-contradicted: #ff8a80; --c-outdated: #b9a2f0; --c-unverified: #a3abbd } }
+:root[data-theme="dark"] { --c-supported: #7fd19b; --c-disputed: #f0b85a; --c-contradicted: #ff8a80; --c-outdated: #b9a2f0; --c-unverified: #a3abbd }
+.claims-intro { color: var(--muted); font-size: .9rem }
+.claims-off { font-size: .85rem; color: var(--muted); font-style: italic } .has-db .claims-off { display: none }
+.claims { list-style: none; padding: 0; margin: 0; display: grid; gap: 12px }
+.claim { background: var(--panel); border: 1px solid var(--line); border-left: 4px solid var(--c-unverified); border-radius: 6px; padding: 10px 12px }
+.claim[data-suggest="supported"] { border-left-color: var(--c-supported) } .claim[data-suggest="disputed"] { border-left-color: var(--c-disputed) }
+.claim[data-suggest="contradicted"] { border-left-color: var(--c-contradicted) } .claim[data-suggest="outdated"] { border-left-color: var(--c-outdated) }
+.claim .ch { display: flex; flex-wrap: wrap; gap: 6px 12px; align-items: baseline; font-size: .82rem }
+.claim .goto { color: var(--muted); font-size: .8rem }
+.lab { font: 600 .72rem/1 var(--body); letter-spacing: .06em; text-transform: uppercase; color: var(--c-unverified) }
+.lab-supported { color: var(--c-supported) } .lab-disputed { color: var(--c-disputed) } .lab-contradicted { color: var(--c-contradicted) } .lab-outdated { color: var(--c-outdated) }
+.claim .cq { font-family: var(--display); margin: 8px 0 4px } .claim .cc { font-weight: 600; margin: 0 0 6px } .claim .cw { color: var(--muted); font-size: .9rem; margin: 0 0 6px }
+.claim .src { font-size: .85rem; margin: 0 0 8px; padding-left: 1.1rem } .claim .src li { margin: 4px 0 } .claim .src .d { color: var(--muted); font: .78rem var(--mono) }
+.rv { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; border-top: 1px dashed var(--line); padding-top: 8px }
+.rv-l { font-size: .8rem; color: var(--muted) } .rv button { padding: 4px 9px; font-size: .8rem } .rv button:disabled { opacity: .5; cursor: default }
+.rv button[aria-pressed="true"] { background: var(--accent); color: var(--accent-ink); border-color: var(--accent) }
+.rv-note { flex: 1 1 140px; min-width: 0; font: inherit; font-size: .82rem; padding: 4px 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--fg) }
+.rv-s { font-size: .78rem; color: var(--muted); width: 100% }
+.claim.reviewed .rv-l::before { content: "✓ "; color: var(--accent) }
+.claims-chip { font-weight: 600 }
 /* Pages: long talks read a page at a time (about 2,500 words); search shows every page at once. */
 .pages { display: inline-flex; align-items: center; gap: 2px; font-size: .85rem; color: var(--muted); flex: none }
 .pages button { padding: 4px 9px; font-size: 1rem; line-height: 1 } .pages button:disabled { opacity: .35; cursor: default }
@@ -499,6 +570,54 @@ JS = r"""
       window.scrollTo({top: pageHeight() * frac, behavior: 'smooth'}); resume.classList.remove('show'); }); }
   links(); onScroll();
 
+  // Claims to review: the person's decision per claim, kept in the page's shared database.
+  var claimEls = slice(document.querySelectorAll('.claim'));
+  document.addEventListener('click', function (e) {
+    var g = e.target.closest && e.target.closest('.claim a.goto'); if (!g) return;
+    var el = document.getElementById(g.getAttribute('href').slice(1)); if (!el) return;
+    e.preventDefault(); reveal(el); light(+el.dataset.t, true);
+  });
+  if (claimEls.length) {
+    claimEls.forEach(function (li) { slice(li.querySelectorAll('.rv button, .rv-note')).forEach(function (b) { b.disabled = true; }); });
+    var reviews = {}, chip = document.getElementById('claims-chip');
+    function showReviews() {
+      var n = 0;
+      claimEls.forEach(function (li) {
+        var r = reviews[li.dataset.id] || null; if (r && r.decision) n++;
+        li.classList.toggle('reviewed', !!(r && r.decision));
+        slice(li.querySelectorAll('.rv button')).forEach(function (b) { b.setAttribute('aria-pressed', r && r.decision === b.dataset.d ? 'true' : 'false'); });
+        var note = li.querySelector('.rv-note'); if (document.activeElement !== note) note.value = r && r.note || '';
+        li.querySelector('.rv-s').textContent = r && r.at ? 'Reviewed ' + r.at.slice(0, 10) : '';
+      });
+      if (chip) chip.textContent = 'Claims: ' + n + ' of ' + claimEls.length + ' reviewed';
+    }
+    showReviews();
+    if (window.claude && typeof window.claude.use === 'function') window.claude.use('db').then(function (db) {
+      if (!db) return;
+      document.body.classList.add('has-db');
+      claimEls.forEach(function (li) { slice(li.querySelectorAll('.rv button, .rv-note')).forEach(function (b) { b.disabled = false; }); });
+      var col = db.collection('reviews'), busy = {};
+      function save(id, patch) {
+        if (busy[id]) return; busy[id] = true;
+        var cur = reviews[id] || {}, next = {decision: 'decision' in patch ? patch.decision : (cur.decision || null), note: 'note' in patch ? patch.note : (cur.note || ''), at: new Date().toISOString()};
+        if (next.decision === (cur.decision || null) && next.note === (cur.note || '')) { busy[id] = false; return; }
+        col.doc(id).set(next).then(function () { say(next.decision ? 'Saved your call' : 'Cleared your call'); },
+          function (e) { say('Could not save: ' + (e && e.message || e)); }).then(function () { busy[id] = false; });
+      }
+      col.onSnapshot(function (snap) { reviews = {}; snap.docs.forEach(function (d) { reviews[d.id] = d.data() || {}; }); showReviews(); },
+        function (e) { say('Reviews are read-only right now: ' + (e && e.message || e)); });
+      document.addEventListener('click', function (e) {
+        var b = e.target.closest && e.target.closest('.rv button'); if (!b) return;
+        var id = b.closest('.claim').dataset.id, cur = reviews[id] || {};
+        save(id, {decision: cur.decision === b.dataset.d ? null : b.dataset.d});
+      });
+      document.addEventListener('change', function (e) {
+        if (!e.target.classList || !e.target.classList.contains('rv-note')) return;
+        save(e.target.closest('.claim').dataset.id, {note: e.target.value.trim()});
+      });
+    });
+  }
+
   // Section jump list: name the section in view, jump on click, close on pick / Escape / outside click.
   var jump = document.getElementById('jump');
   if (jump) {
@@ -569,6 +688,7 @@ def main() -> None:
         ww = [parse_hms(m.group(1)) for m in re.finditer(rf"^- \[({TS})[-\u2013]", notes_md[notes_md.find("## Worth watching"):notes_md.find("## Safe to skip")] if "## Worth watching" in notes_md else "", re.M)]
         frames = grab_frames(vid_file, folder, sec_starts + ww)
     t_html, paras, page_of = transcript_html(transcript_md, url_base, hours, frames)
+    c_html = claims_html(folder, url_base, [p["t"] for p in paras])
     pager_top, pager_bottom = pager_html(transcript_md, page_of)
 
     if frames and "Worth watching" in notes_html:
@@ -581,6 +701,8 @@ def main() -> None:
         notes_html = head + '<h2 id="worth-watching">' + tail
     meta = [f"<span>{hms(duration, hours)}</span>", f"<span>{len(data['words']):,} words</span>",
             f"<span>{len(paras)} paragraphs</span>", f"<span>{esc(src.get('model', 'whisper'))}</span>", "<span>no speaker labels</span>"]
+    if c_html:
+        meta.append('<a href="#claims" class="claims-chip" id="claims-chip">Claims to review</a>')
     if url:
         meta.insert(0, f'<a href="{esc(url)}" target="_blank" rel="noopener">{esc(src.get("uploader") or "source")} ↗</a>')
     elif src.get("path"):
@@ -632,6 +754,7 @@ def main() -> None:
 <div class="wrap">
   <aside class="notes" id="notes">
     {notes_html}
+    {c_html}
     {'<p><button id="copy-notes">Copy notes as markdown</button></p>' if notes_md else ''}
     {lib_links}
   </aside>
